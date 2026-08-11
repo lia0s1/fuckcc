@@ -1,7 +1,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/platform-macOS-black?style=for-the-badge" alt="macOS" />
   <img src="https://img.shields.io/badge/license-MIT-blue?style=for-the-badge" alt="MIT" />
-  <img src="https://img.shields.io/badge/version-4.4.1-orange?style=for-the-badge" alt="version" />
+  <img src="https://img.shields.io/badge/version-4.4.2-orange?style=for-the-badge" alt="version" />
 </p>
 
 <h1 align="center">fuckcc</h1>
