@@ -5,10 +5,12 @@ import { URL } from 'node:url';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+
 const PORT = Number(process.env.FUCKCC_PROXY_PORT || 19283);
 const HOST = process.env.FUCKCC_PROXY_HOST || '127.0.0.1';
 const HOME = process.env.FUCKCC_HOME || path.join(os.homedir(), '.fuckcc');
 const STATE = path.join(HOME, 'proxy.state.json');
+
 function loadUpstream() {
   let u = process.env.FUCKCC_UPSTREAM || '';
   if (!u) {
@@ -22,18 +24,23 @@ function loadUpstream() {
   }
   if (!u) u = process.env.ANTHROPIC_BASE_URL || '';
   if (!u) u = 'https://api.anthropic.com';
-  return u.replace(/\/$/, '');
+  return String(u).replace(/\/$/, '');
 }
+
 const UPSTREAM = loadUpstream();
 let upstreamUrl;
 try {
-  upstreamUrl = new URL(UPSTREAM.includes('://') ? UPSTREAM : `https:
+  const raw = UPSTREAM.includes('://') ? UPSTREAM : 'https://' + UPSTREAM;
+  upstreamUrl = new URL(raw);
 } catch (e) {
   console.error('invalid FUCKCC_UPSTREAM:', UPSTREAM);
   process.exit(1);
 }
+
 const isHttps = upstreamUrl.protocol === 'https:';
 const lib = isHttps ? https : http;
+const listenUrl = 'http://' + HOST + ':' + PORT;
+
 function writeState(extra = {}) {
   try {
     fs.mkdirSync(HOME, { recursive: true });
@@ -44,7 +51,7 @@ function writeState(extra = {}) {
           pid: process.pid,
           host: HOST,
           port: PORT,
-          listen: `http:
+          listen: listenUrl,
           upstream: UPSTREAM,
           startedAt: new Date().toISOString(),
           ...extra,
@@ -55,11 +62,13 @@ function writeState(extra = {}) {
     );
   } catch {}
 }
+
 function clearState() {
   try {
     if (fs.existsSync(STATE)) fs.unlinkSync(STATE);
   } catch {}
 }
+
 const server = http.createServer((req, res) => {
   const incoming = req.url || '/';
   const basePath = upstreamUrl.pathname.replace(/\/$/, '');
@@ -101,21 +110,30 @@ const server = http.createServer((req, res) => {
     if (!res.headersSent) {
       res.writeHead(502, { 'content-type': 'application/json' });
     }
-    res.end(JSON.stringify({ error: 'fuckcc proxy upstream error', message: String(err.message || err) }));
+    res.end(
+      JSON.stringify({
+        error: 'fuckcc proxy upstream error',
+        message: String(err.message || err),
+        upstream: UPSTREAM,
+      })
+    );
   });
   req.pipe(preq);
 });
+
 server.on('error', (e) => {
   console.error('[fuckcc-proxy] listen error:', e.message);
   process.exit(1);
 });
+
 server.listen(PORT, HOST, () => {
   writeState();
-  console.log(`[fuckcc-proxy] listen  http:
-  console.log(`[fuckcc-proxy] upstream ${UPSTREAM}`);
-  console.log(`[fuckcc-proxy] Claude 请用 ANTHROPIC_BASE_URL=http:
-  console.log(`[fuckcc-proxy] state   ${STATE}`);
+  console.log('[fuckcc-proxy] listen  ' + listenUrl);
+  console.log('[fuckcc-proxy] upstream ' + UPSTREAM);
+  console.log('[fuckcc-proxy] Claude ANTHROPIC_BASE_URL=' + listenUrl);
+  console.log('[fuckcc-proxy] state   ' + STATE);
 });
+
 function shutdown() {
   clearState();
   server.close(() => process.exit(0));

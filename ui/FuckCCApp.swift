@@ -31,6 +31,16 @@ enum AppLang: String, CaseIterable, Identifiable {
     case .de: return "Deutsch"
     }
   }
+  var shortLabel: String {
+    switch self {
+    case .auto: return "Auto"
+    case .en: return "EN"
+    case .zh: return "中文"
+    case .ja: return "日本語"
+    case .ko: return "한국어"
+    case .de: return "DE"
+    }
+  }
   static func resolve(_ pref: AppLang) -> AppLang {
     if pref != .auto { return pref }
     let code = Locale.current.language.languageCode?.identifier ?? "en"
@@ -63,6 +73,14 @@ struct L10n {
   var launchPick: String { t("Choose folder & launch Claude", "选择目录并启动 Claude", "フォルダを選んで Claude 起動", "폴더 선택 후 Claude 실행", "Ordner wählen & Claude starten") }
   var services: String { t("Start services", "启动服务", "サービス起動", "서비스 시작", "Dienste starten") }
   var install: String { t("Full install", "完整安装", "フルインストール", "전체 설치", "Vollinstallation") }
+  var uninstall: String { t("Uninstall", "卸载环境", "アンインストール", "환경 제거", "Deinstallieren") }
+  var uninstallConfirm: String { t("Remove shim, PATH, hooks and stop services? Config in ~/.fuckcc is kept unless you purge.", "卸载 shim、PATH、钩子并停止服务？默认保留 ~/.fuckcc 配置；彻底清可用 purge。", "shim/PATH/フックを外しサービス停止。~/.fuckcc は保持（purgeで全削除）。", "shim/PATH/훅 제거 및 서비스 중지. ~/.fuckcc는 유지(purge 시 전체 삭제).", "Shim/PATH/Hooks entfernen, Dienste stoppen. ~/.fuckcc bleibt (purge löscht alles).") }
+  var uninstallPurge: String { t("Uninstall + purge data", "卸载并清空数据", "完全削除", "완전 삭제", "Alles löschen") }
+  var hideDepth: String { t("Hide depth", "伪装深度", "偽装深度", "위장 깊이", "Tarn-Tiefe") }
+  var hideHint: String { t("1 basic · 2 deep · 3 max (no route hijack)", "1基础 · 2深藏 · 3最深（不劫持路由）", "1基本 · 2深い · 3最大（ルート非介入）", "1기본 · 2심화 · 3최대(라우팅 비개입)", "1 Basis · 2 Tief · 3 Max (ohne Routing)") }
+  var hide1: String { t("Basic", "基础", "基本", "기본", "Basis") }
+  var hide2: String { t("Deep", "深藏", "深い", "심화", "Tief") }
+  var hide3: String { t("Max", "最深", "最大", "최대", "Max") }
   var translateOn: String { t("Prompt translation", "提示词翻译", "プロンプト翻訳", "프롬프트 번역", "Prompt-Übersetzung") }
   var translateHint: String { t("Any language → selected region language (local free)", "任意语言 → 所选地区语言（本地免费）", "任意言語→選択地域の言語（無料ローカル）", "모든 언어 → 선택 지역 언어(로컬 무료)", "Beliebige Sprache → Regionsprache (lokal, gratis)") }
   var appLang: String { t("App language", "界面语言", "アプリ言語", "앱 언어", "App-Sprache") }
@@ -170,6 +188,7 @@ final class FuckCCModel: ObservableObject {
   @Published var banner: String?
   @Published var fuckccPath = ""
   @Published var showHelp = false
+  @Published var showUninstallConfirm = false
   var L: L10n { L10n(appLang) }
   let launchModes: [LaunchModeItem] = [
     .init(id: "bypass", title: "Bypass", subtitle: "Full skip", cliHint: "--dangerously-skip-permissions"),
@@ -283,24 +302,35 @@ final class FuckCCModel: ObservableObject {
     }
   }
   func setAppLang(_ lang: AppLang) {
-    guard !busy else { return }; busy = true
+    // 跟系统 Toggle 一样：立刻跟手动画，后台写配置，不挡 UI
+    withAnimation(.spring(response: 0.32, dampingFraction: 0.76)) {
+      appLang = lang
+    }
     Task.detached {
       let r = Shell.runFuckcc(["lang", lang.rawValue])
       await MainActor.run {
-        self.busy = false; self.detailLog = r.1
-        if r.0 == 0 { self.appLang = lang; self.showBanner(lang.label) }
-        else { self.showBanner("lang failed") }
+        self.detailLog = r.1
+        if r.0 == 0 { self.showBanner(lang.label) }
+        else {
+          self.showBanner("lang failed")
+          self.loadAllPrefs()
+        }
       }
     }
   }
   func setHideLevel(_ level: Int) {
-    guard !busy else { return }; busy = true
+    withAnimation(.spring(response: 0.32, dampingFraction: 0.76)) {
+      hideLevel = level
+    }
     Task.detached {
       let r = Shell.runFuckcc(["hide", "\(level)"])
       await MainActor.run {
-        self.busy = false; self.detailLog = r.1
-        if r.0 == 0 { self.hideLevel = level; self.showBanner("hide \(level)"); self.loadAllPrefs() }
-        else { self.showBanner("hide failed") }
+        self.detailLog = r.1
+        if r.0 == 0 { self.showBanner("hide \(level)") }
+        else {
+          self.showBanner("hide failed")
+          self.loadAllPrefs()
+        }
       }
     }
   }
@@ -329,12 +359,40 @@ final class FuckCCModel: ObservableObject {
   }
   func startServices() {
     guard !busy else { return }; busy = true
+    let cfgPath = cfgURL.path
     Task.detached {
-      let a = Shell.runFuckcc(["proxy-start"])
+      // translate always; reverse-proxy only if USE_PROXY=1
+      // account routing (CC Switch) owns BASE_URL — do not hijack
+      var useProxy = false
+      if let text = try? String(contentsOfFile: cfgPath, encoding: .utf8) {
+        for line in text.split(separator: "\n") {
+          let l = String(line)
+          if l.hasPrefix("USE_PROXY=") {
+            let v = String(l.dropFirst(10)).trimmingCharacters(in: .whitespaces)
+            useProxy = (v == "1" || v.lowercased() == "true" || v.lowercased() == "on")
+          }
+        }
+      }
+      var lines: [String] = []
+      var allOk = true
+      if useProxy {
+        let a = Shell.runFuckcc(["proxy-start"])
+        lines.append(a.1)
+        if a.0 != 0 { allOk = false }
+      } else {
+        lines.append("[*] USE_PROXY=0 — skip reverse-proxy; CC Switch / account routing owns BASE_URL")
+        _ = Shell.runFuckcc(["proxy-stop"])
+      }
       let b = Shell.runFuckcc(["translate-daemon-start"])
+      lines.append(b.1)
+      if b.0 != 0 { allOk = false }
+      let log = lines.joined(separator: "\n")
+      let banner = allOk ? "services OK" : "services partial"
       await MainActor.run {
-        self.busy = false; self.detailLog = a.1 + "\n" + b.1
-        self.showBanner("services"); Task { await self.refreshStatus() }
+        self.busy = false
+        self.detailLog = log
+        self.showBanner(banner)
+        Task { await self.refreshStatus() }
       }
     }
   }
@@ -348,6 +406,20 @@ final class FuckCCModel: ObservableObject {
         self.busy = false
         self.detailLog = [r.1, s.1, d.1].joined(separator: "\n")
         self.showBanner(r.0 == 0 ? "install OK" : "install issues")
+        Task { await self.refreshStatus() }
+      }
+    }
+  }
+  func uninstallAll(purge: Bool) {
+    guard !busy else { return }; busy = true
+    Task.detached {
+      var args = ["uninstall"]
+      if purge { args.append("--purge") }
+      let r = Shell.runFuckcc(args, timeout: 120)
+      await MainActor.run {
+        self.busy = false
+        self.detailLog = r.1
+        self.showBanner(r.0 == 0 ? "uninstall OK" : "uninstall issues")
         Task { await self.refreshStatus() }
       }
     }
@@ -391,6 +463,8 @@ private enum UI {
 }
 struct ContentView: View {
   @StateObject private var model = FuckCCModel()
+  @Namespace private var hideGlassNS
+  @Namespace private var langGlassNS
   private var L: L10n { model.L }
   var body: some View {
     ZStack {
@@ -488,41 +562,117 @@ struct ContentView: View {
         .tint(.orange)
       }
       Divider().opacity(0.3)
-      HStack {
+      VStack(alignment: .leading, spacing: 10) {
         VStack(alignment: .leading, spacing: 2) {
-          Text("伪装深度").font(.system(size: 13, weight: .semibold))
-          Text("1基础 · 2深藏 · 3最深").font(.system(size: 10)).foregroundStyle(.secondary)
+          Text(L.hideDepth).font(.system(size: 13, weight: .semibold))
+          Text(L.hideHint).font(.system(size: 10)).foregroundStyle(.secondary)
         }
-        Spacer()
-        Picker("", selection: Binding(
-          get: { model.hideLevel },
-          set: { model.setHideLevel($0) }
-        )) {
-          Text("1").tag(1)
-          Text("2").tag(2)
-          Text("3 最深").tag(3)
+        // 暗底轨道 + 交互玻璃滑块（跟系统 Toggle 一样跟手/可动）
+        liquidPillTrack {
+          pillSeg(
+            title: "1", subtitle: L.hide1,
+            selected: model.hideLevel == 1,
+            ns: hideGlassNS, thumb: "hide-thumb",
+            compact: false
+          ) { model.setHideLevel(1) }
+          pillSeg(
+            title: "2", subtitle: L.hide2,
+            selected: model.hideLevel == 2,
+            ns: hideGlassNS, thumb: "hide-thumb",
+            compact: false
+          ) { model.setHideLevel(2) }
+          pillSeg(
+            title: "3", subtitle: L.hide3,
+            selected: model.hideLevel == 3,
+            ns: hideGlassNS, thumb: "hide-thumb",
+            compact: false
+          ) { model.setHideLevel(3) }
         }
-        .pickerStyle(.segmented)
-        .frame(maxWidth: 180)
       }
       Divider().opacity(0.3)
-      HStack {
+      VStack(alignment: .leading, spacing: 10) {
         Text(L.appLang).font(.system(size: 13, weight: .semibold))
-        Spacer()
-        Picker("", selection: Binding(
-          get: { model.appLang },
-          set: { model.setAppLang($0) }
-        )) {
-          ForEach(AppLang.allCases) { l in
-            Text(l.label).tag(l)
+        liquidPillTrack {
+          ForEach(AppLang.allCases) { lang in
+            pillSeg(
+              title: lang.shortLabel, subtitle: nil,
+              selected: model.appLang == lang,
+              ns: langGlassNS, thumb: "lang-thumb",
+              compact: true
+            ) { model.setAppLang(lang) }
+            .help(lang.label)
           }
         }
-        .pickerStyle(.menu)
-        .frame(maxWidth: 160)
       }
     }
     .padding(16)
-    .background(RoundedRectangle(cornerRadius: UI.r, style: .continuous).fill(Color(white: 0.97)))
+    .background {
+      RoundedRectangle(cornerRadius: UI.r, style: .continuous)
+        .fill(Color(white: 0.96))
+    }
+  }
+  /// 纯白连续胶囊轨道（灰底卡片上的白条，对比清楚）
+  @ViewBuilder
+  func liquidPillTrack<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+    HStack(spacing: 0) {
+      content()
+    }
+    .padding(3)
+    .background {
+      Capsule(style: .continuous)
+        .fill(Color.white)
+    }
+    .overlay {
+      Capsule(style: .continuous)
+        .stroke(Color.black.opacity(0.08), lineWidth: 1)
+    }
+  }
+  /// 分段格：字永远在最上层；滑块只做背景 matchedGeometry，绝不 glass 透镜糊字
+  @ViewBuilder
+  func pillSeg(
+    title: String,
+    subtitle: String?,
+    selected: Bool,
+    ns: Namespace.ID,
+    thumb: String,
+    compact: Bool,
+    action: @escaping () -> Void
+  ) -> some View {
+    Button(action: action) {
+      Group {
+        if let subtitle {
+          VStack(spacing: 1) {
+            Text(title).font(.system(size: 14, weight: .bold, design: .rounded))
+            Text(subtitle).font(.system(size: 10, weight: .semibold))
+          }
+        } else {
+          Text(title).font(.system(size: compact ? 11 : 12, weight: .semibold))
+        }
+      }
+      .foregroundStyle(
+        selected
+          ? Color(red: 0.10, green: 0.08, blue: 0.07)
+          : Color(red: 0.42, green: 0.40, blue: 0.38)
+      )
+      .frame(maxWidth: .infinity)
+      .frame(minHeight: compact ? 36 : 46)
+      .padding(.horizontal, compact ? 2 : 4)
+      .contentShape(Capsule(style: .continuous))
+      // 背景滑块：白底 + 淡描边 + 轻阴影，动画跟手；不用 glassEffect（会透镜糊字）
+      .background {
+        if selected {
+          Capsule(style: .continuous)
+            .fill(Color.white)
+            .overlay {
+              Capsule(style: .continuous)
+                .stroke(Color.black.opacity(0.10), lineWidth: 1)
+            }
+            .shadow(color: Color.black.opacity(0.10), radius: 4, y: 1)
+            .matchedGeometryEffect(id: thumb, in: ns)
+        }
+      }
+    }
+    .buttonStyle(.plain)
   }
   var workDirCard: some View {
     VStack(alignment: .leading, spacing: 10) {
@@ -607,6 +757,19 @@ struct ContentView: View {
           Label(L.install, systemImage: "hammer.fill").frame(maxWidth: .infinity, minHeight: UI.actionH)
         }.buttonStyle(SoftRound()).disabled(model.busy)
       }
+      Button { model.showUninstallConfirm = true } label: {
+        Label(L.uninstall, systemImage: "trash")
+          .frame(maxWidth: .infinity, minHeight: UI.actionH)
+      }
+      .buttonStyle(SoftDangerRound())
+      .disabled(model.busy)
+    }
+    .confirmationDialog(L.uninstall, isPresented: $model.showUninstallConfirm, titleVisibility: .visible) {
+      Button(L.uninstall, role: .destructive) { model.uninstallAll(purge: false) }
+      Button(L.uninstallPurge, role: .destructive) { model.uninstallAll(purge: true) }
+      Button("Cancel", role: .cancel) {}
+    } message: {
+      Text(L.uninstallConfirm)
     }
   }
   var logCard: some View {
@@ -652,6 +815,27 @@ struct SoftRound: ButtonStyle {
         else { Capsule(style: .continuous).stroke(Color(white: 0.90), lineWidth: 1) }
       }
       .opacity(configuration.isPressed ? 0.85 : 1)
+      .scaleEffect(configuration.isPressed ? 0.98 : 1)
+  }
+}
+/// 淡玫瑰红 + 全圆角胶囊，别他妈刺眼大红
+struct SoftDangerRound: ButtonStyle {
+  private let ink = Color(red: 0.62, green: 0.32, blue: 0.34)
+  private let fill = Color(red: 0.97, green: 0.93, blue: 0.93)
+  private let stroke = Color(red: 0.88, green: 0.78, blue: 0.78)
+  func makeBody(configuration: Configuration) -> some View {
+    configuration.label
+      .font(.system(size: 13, weight: .semibold))
+      .foregroundStyle(ink)
+      .background(
+        Capsule(style: .continuous)
+          .fill(fill)
+      )
+      .overlay(
+        Capsule(style: .continuous)
+          .stroke(stroke, lineWidth: 1)
+      )
+      .opacity(configuration.isPressed ? 0.88 : 1)
       .scaleEffect(configuration.isPressed ? 0.98 : 1)
   }
 }

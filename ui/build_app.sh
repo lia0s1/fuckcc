@@ -32,8 +32,8 @@ cat >"$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key><string>fuckcc</string>
   <key>CFBundleDisplayName</key><string>fuckcc</string>
   <key>CFBundleIdentifier</key><string>local.fuckcc.control</string>
-  <key>CFBundleVersion</key><string>4.4.1</string>
-  <key>CFBundleShortVersionString</key><string>4.4.1</string>
+  <key>CFBundleVersion</key><string>4.4.2</string>
+  <key>CFBundleShortVersionString</key><string>4.4.2</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleExecutable</key><string>FuckCC</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>

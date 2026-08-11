@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-FUCKCC_VERSION="4.4.1"
+FUCKCC_VERSION="4.4.2"
 FUCKCC_HOME="${FUCKCC_HOME:-$HOME/.fuckcc}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REGIONS_FILE="${FUCKCC_REGIONS:-$SCRIPT_DIR/regions.json}"
@@ -55,7 +55,7 @@ PERSONA_PROMPT=1
 USE_HOOK=1
 DISABLE_TELEMETRY=1
 LAUNCH_MODE=bypass
-USE_PROXY=1
+USE_PROXY=0
 FUCKCC_PROXY_PORT=19283
 EOF
   fi
@@ -475,7 +475,7 @@ run_claude() {
   need_regions
   region_exists "$region_id" || die "未知地区: $region_id"
 
-  if [[ "$(cfg_get USE_PROXY 1)" == "1" ]]; then
+  if [[ "$(cfg_get USE_PROXY 0)" == "1" ]]; then
     ensure_settings_proxy_url >/dev/null 2>&1 || true
     local up
     up=$(proxy_upstream)
@@ -834,6 +834,129 @@ cmd_uninstall_shim() {
   grep -n 'fuckcc/shim' "$HOME/.zshrc" "$HOME/.bashrc" 2>/dev/null || true
 }
 
+cmd_uninstall() {
+  ensure_home
+  local purge="${1:-}"
+  info "卸载 fuckcc 环境…"
+
+  cmd_proxy_stop 2>/dev/null || true
+  cmd_translate_daemon_stop 2>/dev/null || true
+
+  if pgrep -f "$MENU_BIN" >/dev/null 2>&1; then
+    pkill -f "$MENU_BIN" 2>/dev/null || true
+    ok "已停菜单栏"
+  fi
+  if pgrep -x FuckCC >/dev/null 2>&1; then
+    info "控制面板进程还在（若正在用本 App 卸载，结束后自行退出即可）"
+  fi
+
+  rm -f "$FUCKCC_HOME/shim/claude" 2>/dev/null || true
+  ok "已删 shim"
+
+  restore_wrapped_claude() {
+    local path="$1"
+    local bak="${path}.pre-fuckcc"
+    if [[ -e "$path" ]] && grep -q "$SHIM_MARKER" "$path" 2>/dev/null; then
+      if [[ -e "$bak" ]]; then
+        mv -f "$bak" "$path"
+        chmod +x "$path" 2>/dev/null || true
+        ok "已还原: $path"
+      else
+        rm -f "$path"
+        ok "已删包装: $path"
+      fi
+    fi
+  }
+  restore_wrapped_claude "$HOME/.local/bin/claude"
+  restore_wrapped_claude "$HOME/.npm-global/bin/claude"
+
+  local rc
+  for rc in "$HOME/.zshenv" "$HOME/.zshrc" "$HOME/.zprofile" "$HOME/.bash_profile" "$HOME/.bashrc"; do
+    [[ -f "$rc" ]] || continue
+    if grep -qE 'fuckcc/shim|fuckcc-auto' "$rc" 2>/dev/null; then
+      local tmp
+      tmp=$(mktemp)
+      grep -vE 'fuckcc/shim|fuckcc-auto' "$rc" >"$tmp" || true
+      mv "$tmp" "$rc"
+      ok "已清 PATH: $rc"
+    fi
+  done
+
+  python3 - <<'PY'
+import json
+from pathlib import Path
+sp = Path.home() / ".claude" / "settings.json"
+if not sp.exists():
+    raise SystemExit(0)
+try:
+    data = json.loads(sp.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(0)
+changed = False
+env = data.get("env")
+if isinstance(env, dict):
+    if env.pop("FUCKCC_PROMPT_HOOK", None) is not None:
+        changed = True
+    base = (env.get("ANTHROPIC_BASE_URL") or "")
+    if "127.0.0.1:19283" in base or "localhost:19283" in base:
+        env.pop("ANTHROPIC_BASE_URL", None)
+        changed = True
+        print("removed local fuckcc proxy BASE_URL from settings")
+    data["env"] = env
+hooks = data.get("hooks")
+if isinstance(hooks, dict):
+    ups = hooks.get("UserPromptSubmit")
+    if isinstance(ups, list):
+        new = []
+        for item in ups:
+            hs = (item or {}).get("hooks") if isinstance(item, dict) else None
+            keep = True
+            if isinstance(hs, list):
+                for h in hs:
+                    cmd = str((h or {}).get("command") or "")
+                    if "user_prompt_submit.py" in cmd or "fuckcc" in cmd:
+                        keep = False
+                        break
+            if keep:
+                new.append(item)
+        if len(new) != len(ups):
+            if new:
+                hooks["UserPromptSubmit"] = new
+            else:
+                hooks.pop("UserPromptSubmit", None)
+            changed = True
+            print("removed UserPromptSubmit fuckcc hook")
+    if hooks:
+        data["hooks"] = hooks
+    else:
+        data.pop("hooks", None)
+        changed = True
+if changed:
+    sp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print("settings.json cleaned")
+else:
+    print("settings.json: nothing fuckcc-related")
+PY
+
+  rm -f "$FUCKCC_HOME/proxy.state.json" \
+        "$FUCKCC_HOME/translate_daemon.state.json" \
+        "$FUCKCC_HOME/proxy.log" \
+        "$FUCKCC_HOME/translate_daemon.log" \
+        "$FUCKCC_HOME/translate.log" \
+        "$FUCKCC_HOME/ui.log" \
+        "$FUCKCC_HOME/region_persona.txt" 2>/dev/null || true
+
+  if [[ "$purge" == "--purge" || "$purge" == "purge" || "$purge" == "--all" ]]; then
+    rm -rf "$FUCKCC_HOME"
+    ok "已删除整个 ~/.fuckcc"
+  else
+    ok "保留 ~/.fuckcc 配置/模型缓存（彻底清: fuckcc uninstall --purge）"
+  fi
+
+  ok "卸载完成。新开终端后 which claude 应不再指向 fuckcc"
+  info "若仍走 shim: hash -r 或开新终端"
+}
+
 cmd_install_menubar() {
   ensure_home
   [[ -f "$MENU_SRC" ]] || die "缺少 $MENU_SRC"
@@ -1098,7 +1221,6 @@ cmd_install_global() {
   cmd_build_hook 2>/dev/null || true
   write_shim
   cmd_install_hooks
-  cfg_set USE_PROXY 1
   cfg_set DEEP 1
   cfg_set USE_HOOK 1
   cfg_set PROMPT_TRANSLATE 1
@@ -1160,11 +1282,16 @@ EOF
     ok "已覆盖 ~/.npm-global/bin/claude -> fuckcc"
   fi
 
-  cmd_proxy_start || warn "proxy 先起失败，下次 claude 会再试"
+  if [[ "$(cfg_get USE_PROXY 0)" == "1" ]]; then
+    cmd_proxy_start || warn "proxy 先起失败，下次 claude 会再试"
+  else
+    info "USE_PROXY=0：不劫持 ANTHROPIC_BASE_URL，交给 CC Switch / 官方账号路由"
+  fi
   cmd_translate_daemon_start || true
   ok "安装完成。新开终端后: claude / claude --dangerously-skip-permissions 全部自动伪装"
   info "切地区: fuckcc use us-west | jp | uk ..."
   info "翻译开关: ~/.fuckcc/config 里 PROMPT_TRANSLATE=1"
+  info "中转域名反代(可选，会跟 CC Switch 账号路由冲突): fuckcc proxy-start"
 }
 
 
@@ -1264,16 +1391,16 @@ cmd_set_hide() {
   local v="${1:-}"
   case "$v" in
     1|base|normal) cfg_set HIDE_LEVEL 1; cfg_set DEEP 0; cfg_set PERSONA_PROMPT 0; ok "HIDE_LEVEL=1 (基础时区/locale)" ;;
-    2|deep) cfg_set HIDE_LEVEL 2; cfg_set DEEP 1; cfg_set USE_HOOK 1; cfg_set SANITIZE 1; cfg_set PERSONA_PROMPT 1; cfg_set USE_PROXY 1; ok "HIDE_LEVEL=2 (深藏: env清理+人设+代理)" ;;
-    3|max|deeper) cfg_set HIDE_LEVEL 3; cfg_set DEEP 1; cfg_set USE_HOOK 1; cfg_set SANITIZE 1; cfg_set PERSONA_PROMPT 1; cfg_set USE_PROXY 1; cfg_set DISABLE_TELEMETRY 1; ok "HIDE_LEVEL=3 (最深: +终端指纹清理)" ;;
+    2|deep) cfg_set HIDE_LEVEL 2; cfg_set DEEP 1; cfg_set USE_HOOK 1; cfg_set SANITIZE 1; cfg_set PERSONA_PROMPT 1; ok "HIDE_LEVEL=2 (深藏: env清理+人设，不劫持路由)" ;;
+    3|max|deeper) cfg_set HIDE_LEVEL 3; cfg_set DEEP 1; cfg_set USE_HOOK 1; cfg_set SANITIZE 1; cfg_set PERSONA_PROMPT 1; cfg_set DISABLE_TELEMETRY 1; ok "HIDE_LEVEL=3 (最深: +终端指纹清理，不劫持路由)" ;;
     status|"")
       echo "HIDE_LEVEL=$(cfg_get HIDE_LEVEL 2)"
       echo "DEEP=$(cfg_get DEEP 1)"
       echo "PERSONA_PROMPT=$(cfg_get PERSONA_PROMPT 1)"
-      echo "USE_PROXY=$(cfg_get USE_PROXY 1)"
+      echo "USE_PROXY=$(cfg_get USE_PROXY 0)"
       echo "USE_HOOK=$(cfg_get USE_HOOK 1)"
       ;;
-    *) die "fuckcc hide 1|2|3|status   (1基础 2深藏 3最深)" ;;
+    *) die "fuckcc hide 1|2|3|status   (1基础 2深藏 3最深；域名反代请单独 fuckcc proxy-start)" ;;
   esac
 }
 
@@ -1296,6 +1423,7 @@ ${C_BLD}加深伪装:${C_RST}
   fuckcc install / install-global  装死：所有 claude 命令自动伪装+翻译钩子
   fuckcc install-hooks         只装提示词翻译钩子
   fuckcc install-shim         只装 PATH shim
+  fuckcc uninstall [--purge]  卸载环境（--purge 连 ~/.fuckcc 一起删）
   fuckcc install-menubar / menubar
   fuckcc ui                     打开图形控制台
 
@@ -1346,7 +1474,8 @@ main() {
     translate-setup|local-translate) python3 "$SCRIPT_DIR/lib/translate_setup.py" ;;
     translate-daemon-start) cmd_translate_daemon_start ;;
     translate-daemon-stop) cmd_translate_daemon_stop ;;
-    uninstall-shim|uninstall) cmd_uninstall_shim ;;
+    uninstall-shim) cmd_uninstall_shim ;;
+    uninstall|remove|purge) cmd_uninstall "${1:-}" ;;
     install-menubar) cmd_install_menubar ;;
     menubar|menu) cmd_menubar ;;
     ui|gui|panel) cmd_ui ;;
