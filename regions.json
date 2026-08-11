@@ -1,0 +1,122 @@
+{
+  "us-west": {
+    "name": "美国西部 (洛杉矶)",
+    "TZ": "America/Los_Angeles",
+    "LANG": "en_US.UTF-8",
+    "LC_ALL": "en_US.UTF-8",
+    "LC_TIME": "en_US.UTF-8",
+    "LC_MESSAGES": "en_US.UTF-8",
+    "LANGUAGE": "en_US:en",
+    "HOSTNAME": "MacBook-Pro.local"
+  },
+  "us-east": {
+    "name": "美国东部 (纽约)",
+    "TZ": "America/New_York",
+    "LANG": "en_US.UTF-8",
+    "LC_ALL": "en_US.UTF-8",
+    "LC_TIME": "en_US.UTF-8",
+    "LC_MESSAGES": "en_US.UTF-8",
+    "LANGUAGE": "en_US:en",
+    "HOSTNAME": "MacBook-Pro.local"
+  },
+  "us-central": {
+    "name": "美国中部 (芝加哥)",
+    "TZ": "America/Chicago",
+    "LANG": "en_US.UTF-8",
+    "LC_ALL": "en_US.UTF-8",
+    "LC_TIME": "en_US.UTF-8",
+    "LC_MESSAGES": "en_US.UTF-8",
+    "LANGUAGE": "en_US:en",
+    "HOSTNAME": "MacBook-Pro.local"
+  },
+  "jp": {
+    "name": "日本 (东京)",
+    "TZ": "Asia/Tokyo",
+    "LANG": "en_US.UTF-8",
+    "LC_ALL": "en_US.UTF-8",
+    "LC_TIME": "en_US.UTF-8",
+    "LC_MESSAGES": "en_US.UTF-8",
+    "LANGUAGE": "en_US:en",
+    "HOSTNAME": "MacBook-Pro.local"
+  },
+  "sg": {
+    "name": "新加坡",
+    "TZ": "Asia/Singapore",
+    "LANG": "en_US.UTF-8",
+    "LC_ALL": "en_US.UTF-8",
+    "LC_TIME": "en_US.UTF-8",
+    "LC_MESSAGES": "en_US.UTF-8",
+    "LANGUAGE": "en_US:en",
+    "HOSTNAME": "MacBook-Pro.local"
+  },
+  "tw": {
+    "name": "台湾 (台北)",
+    "TZ": "Asia/Taipei",
+    "LANG": "en_US.UTF-8",
+    "LC_ALL": "en_US.UTF-8",
+    "LC_TIME": "en_US.UTF-8",
+    "LC_MESSAGES": "en_US.UTF-8",
+    "LANGUAGE": "en_US:en",
+    "HOSTNAME": "MacBook-Pro.local"
+  },
+  "hk": {
+    "name": "香港",
+    "TZ": "Asia/Hong_Kong",
+    "LANG": "en_US.UTF-8",
+    "LC_ALL": "en_US.UTF-8",
+    "LC_TIME": "en_US.UTF-8",
+    "LC_MESSAGES": "en_US.UTF-8",
+    "LANGUAGE": "en_US:en",
+    "HOSTNAME": "MacBook-Pro.local"
+  },
+  "kr": {
+    "name": "韩国 (首尔)",
+    "TZ": "Asia/Seoul",
+    "LANG": "en_US.UTF-8",
+    "LC_ALL": "en_US.UTF-8",
+    "LC_TIME": "en_US.UTF-8",
+    "LC_MESSAGES": "en_US.UTF-8",
+    "LANGUAGE": "en_US:en",
+    "HOSTNAME": "MacBook-Pro.local"
+  },
+  "uk": {
+    "name": "英国 (伦敦)",
+    "TZ": "Europe/London",
+    "LANG": "en_US.UTF-8",
+    "LC_ALL": "en_US.UTF-8",
+    "LC_TIME": "en_US.UTF-8",
+    "LC_MESSAGES": "en_US.UTF-8",
+    "LANGUAGE": "en_US:en",
+    "HOSTNAME": "MacBookPro.local"
+  },
+  "de": {
+    "name": "德国 (柏林)",
+    "TZ": "Europe/Berlin",
+    "LANG": "en_US.UTF-8",
+    "LC_ALL": "en_US.UTF-8",
+    "LC_TIME": "en_US.UTF-8",
+    "LC_MESSAGES": "en_US.UTF-8",
+    "LANGUAGE": "en_US:en",
+    "HOSTNAME": "MacBook-Pro.local"
+  },
+  "au": {
+    "name": "澳大利亚 (悉尼)",
+    "TZ": "Australia/Sydney",
+    "LANG": "en_US.UTF-8",
+    "LC_ALL": "en_US.UTF-8",
+    "LC_TIME": "en_US.UTF-8",
+    "LC_MESSAGES": "en_US.UTF-8",
+    "LANGUAGE": "en_US:en",
+    "HOSTNAME": "MacBook-Pro.local"
+  },
+  "ca": {
+    "name": "加拿大 (多伦多)",
+    "TZ": "America/Toronto",
+    "LANG": "en_US.UTF-8",
+    "LC_ALL": "en_US.UTF-8",
+    "LC_TIME": "en_US.UTF-8",
+    "LC_MESSAGES": "en_US.UTF-8",
+    "LANGUAGE": "en_US:en",
+    "HOSTNAME": "MacBook-Pro.local"
+  }
+}

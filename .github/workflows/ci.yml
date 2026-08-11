@@ -1,0 +1,23 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  shell-python:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n
+        run: bash -n fuckcc && bash -n install.sh && bash -n hook/build_hook.sh && bash -n ui/build_app.sh
+      - name: python syntax
+        run: |
+          python3 -m py_compile hooks/user_prompt_submit.py
+          python3 -m py_compile lib/translate_core.py
+          python3 -m py_compile lib/translate_daemon.py
+          python3 -m py_compile lib/translate_setup.py
+          python3 -m py_compile lib/resolve_upstream.py
+      - name: version present
+        run: test -f VERSION && test -s VERSION

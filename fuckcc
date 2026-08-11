@@ -1,0 +1,1367 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+FUCKCC_VERSION="4.4.1"
+FUCKCC_HOME="${FUCKCC_HOME:-$HOME/.fuckcc}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REGIONS_FILE="${FUCKCC_REGIONS:-$SCRIPT_DIR/regions.json}"
+CONFIG_FILE="$FUCKCC_HOME/config"
+STATE_FILE="$FUCKCC_HOME/current_region"
+REAL_BIN_FILE="$FUCKCC_HOME/real_claude"
+HOOK_SRC="$SCRIPT_DIR/hook/tz_override.c"
+HOOK_BUILD="$SCRIPT_DIR/hook/build_hook.sh"
+HOOK_DYLIB_DEFAULT="$SCRIPT_DIR/hook/libfuckcc_tz.dylib"
+HOOK_DYLIB_HOME="$FUCKCC_HOME/libfuckcc_tz.dylib"
+MENU_SRC="$SCRIPT_DIR/menubar/FuckCCMenu.swift"
+MENU_BIN="$FUCKCC_HOME/FuckCCMenu"
+SHIM_MARKER="# fuckcc-shim"
+
+BANNED_TZ=("Asia/Shanghai" "Asia/Urumqi")
+
+RISKY_HOST_HINTS=()
+load_risky_hints() {
+  local f="$SCRIPT_DIR/data/geo_probe_host_keywords.txt"
+  RISKY_HOST_HINTS=()
+  [[ -f "$f" ]] || return 0
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    RISKY_HOST_HINTS+=("$line")
+  done <"$f"
+}
+
+if [[ -t 1 ]]; then
+  C_RED=$'\033[31m'; C_GRN=$'\033[32m'; C_YEL=$'\033[33m'
+  C_CYN=$'\033[36m'; C_DIM=$'\033[2m'; C_BLD=$'\033[1m'; C_RST=$'\033[0m'
+else
+  C_RED=; C_GRN=; C_YEL=; C_CYN=; C_DIM=; C_BLD=; C_RST=
+fi
+
+die()  { echo "${C_RED}error:${C_RST} $*" >&2; exit 1; }
+info() { echo "${C_CYN}[*]${C_RST} $*"; }
+ok()   { echo "${C_GRN}[+]${C_RST} $*"; }
+warn() { echo "${C_YEL}[!]${C_RST} $*"; }
+
+ensure_home() {
+  mkdir -p "$FUCKCC_HOME" "$FUCKCC_HOME/shim"
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    cat >"$CONFIG_FILE" <<EOF
+DEFAULT_REGION=us-west
+VERBOSE=1
+SANITIZE=1
+DEEP=1
+HIDE_LEVEL=3
+PERSONA_PROMPT=1
+USE_HOOK=1
+DISABLE_TELEMETRY=1
+LAUNCH_MODE=bypass
+USE_PROXY=1
+FUCKCC_PROXY_PORT=19283
+EOF
+  fi
+  [[ -f "$STATE_FILE" ]] || echo "us-west" >"$STATE_FILE"
+  if [[ ! -f "$FUCKCC_HOME/sanitize.extra" ]]; then
+    cat >"$FUCKCC_HOME/sanitize.extra" <<'EOF'
+EOF
+  fi
+}
+
+need_regions() {
+  [[ -f "$REGIONS_FILE" ]] || die "找不到 regions.json: $REGIONS_FILE"
+  command -v python3 >/dev/null || die "需要 python3"
+}
+
+current_region() {
+  ensure_home
+  if [[ -f "$STATE_FILE" ]]; then cat "$STATE_FILE"
+  else cfg_get DEFAULT_REGION "us-west"
+  fi
+}
+
+cfg_get() {
+  local key="$1" default="${2:-}"
+  ensure_home
+  if [[ -f "$CONFIG_FILE" ]]; then
+    local v
+    v=$(grep -E "^${key}=" "$CONFIG_FILE" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+    [[ -n "${v:-}" ]] && { echo "$v"; return; }
+  fi
+  echo "$default"
+}
+
+cfg_set() {
+  local key="$1" val="$2"
+  ensure_home
+  if grep -qE "^${key}=" "$CONFIG_FILE" 2>/dev/null; then
+    sed -i '' -E "s|^${key}=.*|${key}=${val}|" "$CONFIG_FILE"
+  else
+    echo "${key}=${val}" >>"$CONFIG_FILE"
+  fi
+}
+
+region_exists() {
+  python3 - "$REGIONS_FILE" "$1" <<'PY'
+import json,sys
+sys.exit(0 if sys.argv[2] in json.load(open(sys.argv[1])) else 1)
+PY
+}
+
+region_field() {
+  python3 - "$REGIONS_FILE" "$1" "$2" <<'PY'
+import json,sys
+print(json.load(open(sys.argv[1]))[sys.argv[2]].get(sys.argv[3],""))
+PY
+}
+
+list_regions() {
+  need_regions
+  local cur; cur=$(current_region)
+  python3 - "$REGIONS_FILE" "$cur" <<'PY'
+import json,sys
+data=json.load(open(sys.argv[1])); cur=sys.argv[2]
+print(f"{'ID':<14} {'时区':<22} 名称")
+print("-"*60)
+for k,v in data.items():
+    mark=" *" if k==cur else "  "
+    print(f"{mark}{k:<12} {v.get('TZ',''):<22} {v.get('name','')}")
+print("\n* = 当前默认伪装地区")
+PY
+}
+
+set_region() {
+  local id="$1"
+  need_regions
+  region_exists "$id" || die "未知地区: $id  (fuckcc regions)"
+  local tz; tz=$(region_field "$id" TZ)
+  for b in "${BANNED_TZ[@]}"; do
+    [[ "$tz" == "$b" ]] && die "黑名单时区 ${tz}, 别用"
+  done
+  ensure_home
+  echo "$id" >"$STATE_FILE"
+  cfg_set DEFAULT_REGION "$id"
+  ok "默认伪装 -> ${C_BLD}$id${C_RST} ($(region_field "$id" name))  TZ=$tz"
+  info "系统时区未动；仅 fuckcc/shim 启动的 Claude 吃这套"
+}
+
+find_hook_dylib() {
+  if [[ -f "$HOOK_DYLIB_HOME" ]]; then echo "$HOOK_DYLIB_HOME"; return; fi
+  if [[ -f "$HOOK_DYLIB_DEFAULT" ]]; then echo "$HOOK_DYLIB_DEFAULT"; return; fi
+  return 1
+}
+
+find_real_claude() {
+  local configured; configured=$(cfg_get REAL_CLAUDE "")
+  if [[ -n "$configured" && -x "$configured" ]] && ! grep -q "$SHIM_MARKER" "$configured" 2>/dev/null; then
+    echo "$configured"; return
+  fi
+  if [[ -f "$REAL_BIN_FILE" ]]; then
+    local saved; saved=$(cat "$REAL_BIN_FILE")
+    if [[ -x "$saved" ]] && ! grep -q "$SHIM_MARKER" "$saved" 2>/dev/null; then
+      echo "$saved"; return
+    fi
+  fi
+  local cand
+  for cand in \
+    "$HOME/.local/bin/claude.pre-fuckcc" \
+    "$HOME/.npm-global/bin/claude.pre-fuckcc" \
+    "$HOME/.local/bin/claude.orig" \
+    "$HOME/.local/bin/claude" \
+    "$HOME/.npm-global/bin/claude" \
+    /opt/homebrew/bin/claude \
+    /usr/local/bin/claude
+  do
+    if [[ -x "$cand" ]] && ! grep -q "$SHIM_MARKER" "$cand" 2>/dev/null; then
+      case "$cand" in
+        "$FUCKCC_HOME"/shim/*) continue ;;
+      esac
+      echo "$cand"; return
+    fi
+  done
+  local p
+  while IFS= read -r p; do
+    [[ -z "$p" ]] && continue
+    case "$p" in "$FUCKCC_HOME"/shim/*) continue ;; esac
+    if [[ -x "$p" ]] && ! grep -q "$SHIM_MARKER" "$p" 2>/dev/null; then
+      echo "$p"; return
+    fi
+  done < <(type -a claude 2>/dev/null | awk '{print $NF}' | sort -u)
+  return 1
+}
+
+build_env_exports() {
+  local id="$1"
+  need_regions
+  region_exists "$id" || die "未知地区: $id"
+
+  local tz lang lcall lctime lcmsg language deep
+  tz=$(region_field "$id" TZ)
+  lang=$(region_field "$id" LANG)
+  lcall=$(region_field "$id" LC_ALL)
+  lctime=$(region_field "$id" LC_TIME)
+  lcmsg=$(region_field "$id" LC_MESSAGES)
+  language=$(region_field "$id" LANGUAGE)
+  hname=$(region_field "$id" HOSTNAME)
+  [[ -z "$hname" ]] && hname="MacBook-Pro.local"
+  deep=$(cfg_get DEEP 1)
+
+  for b in "${BANNED_TZ[@]}"; do
+    [[ "$tz" == "$b" ]] && die "黑名单时区 $tz"
+  done
+
+  cat <<EOF
+export TZ=$(printf %q "$tz")
+export LANG=$(printf %q "$lang")
+export LC_ALL=$(printf %q "$lcall")
+export LC_TIME=$(printf %q "$lctime")
+export LC_MESSAGES=$(printf %q "$lcmsg")
+export LANGUAGE=$(printf %q "$language")
+export LC_CTYPE=$(printf %q "$lcall")
+export LC_NUMERIC=$(printf %q "$lcall")
+export LC_COLLATE=$(printf %q "$lcall")
+export LC_MONETARY=$(printf %q "$lcall")
+export LC_PAPER=$(printf %q "$lcall")
+export LC_NAME=$(printf %q "$lcall")
+export LC_ADDRESS=$(printf %q "$lcall")
+export LC_TELEPHONE=$(printf %q "$lcall")
+export LC_MEASUREMENT=$(printf %q "$lcall")
+export LC_IDENTIFICATION=$(printf %q "$lcall")
+export FUCKCC_ACTIVE=1
+export FUCKCC_REGION=$(printf %q "$id")
+export FUCKCC_TZ=$(printf %q "$tz")
+export FUCKCC_DEEP=$(printf %q "$deep")
+export FUCKCC_LANG=$(printf %q "$lang")
+export FUCKCC_HOSTNAME=$(printf %q "$hname")
+export HOSTNAME=$(printf %q "$hname")
+export HOST=$(printf %q "$hname")
+export LC_ALL=$(printf %q "$lcall")
+EOF
+
+  if [[ "$(cfg_get DISABLE_TELEMETRY 1)" == "1" ]]; then
+    cat <<'EOF'
+export DISABLE_TELEMETRY=1
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+export CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+export DO_NOT_TRACK=1
+export OTEL_SDK_DISABLED=1
+export CLAUDE_CODE_ENABLE_TELEMETRY=0
+EOF
+  fi
+
+  local force_base; force_base=$(cfg_get FORCE_BASE_URL "")
+  if [[ -n "$force_base" ]]; then
+    echo "export ANTHROPIC_BASE_URL=$(printf %q "$force_base")"
+  fi
+
+
+  if [[ "$(cfg_get USE_PROXY 0)" == "1" ]]; then
+    local pport phost
+    pport=$(cfg_get FUCKCC_PROXY_PORT 19283)
+    phost=$(cfg_get FUCKCC_PROXY_HOST 127.0.0.1)
+    if [[ -f "$FUCKCC_HOME/proxy.state.json" ]]; then
+      echo "export ANTHROPIC_BASE_URL=$(printf %q "http://${phost}:${pport}")"
+      echo "export FUCKCC_PROXY_ACTIVE=1"
+    else
+      echo "# proxy enabled but not running — fuckcc proxy-start" >&2
+    fi
+  fi
+
+  if [[ "$(cfg_get USE_HOOK 1)" == "1" ]]; then
+    local dylib
+    if dylib=$(find_hook_dylib 2>/dev/null); then
+      cat <<EOF
+export DYLD_INSERT_LIBRARIES=$(printf %q "$dylib")\${DYLD_INSERT_LIBRARIES:+:\$DYLD_INSERT_LIBRARIES}
+export DYLD_FORCE_FLAT_NAMESPACE=0
+EOF
+    fi
+  fi
+
+  if [[ "$(cfg_get SANITIZE 1)" == "1" ]]; then
+    cat <<'EOF'
+unset CLAUDE_CODE_SHELL_PREFIX 2>/dev/null || true
+EOF
+    local hide
+    hide=$(cfg_get HIDE_LEVEL "")
+    if [[ -z "$hide" ]]; then
+      [[ "$deep" == "1" ]] && hide=2 || hide=1
+    fi
+    if [[ "$hide" -ge 2 ]]; then
+      cat <<'EOF'
+unset PYTHONIOENCODING 2>/dev/null || true
+unset CN_MIRROR 2>/dev/null || true
+unset LANGUAGE 2>/dev/null || true
+unset LC_ALL LC_CTYPE LC_TIME LC_MESSAGES LC_NUMERIC LC_COLLATE 2>/dev/null || true
+unset LC_MONETARY LC_PAPER LC_NAME LC_ADDRESS LC_TELEPHONE LC_MEASUREMENT LC_IDENTIFICATION 2>/dev/null || true
+unset APPLE_LANGUAGE APPLE_LANGUAGES 2>/dev/null || true
+unset CLAUDE_CODE_REMOTE CLAUDE_CODE_ENTRYPOINT 2>/dev/null || true
+unset SSH_CONNECTION SSH_CLIENT SSH_TTY 2>/dev/null || true
+unset VSCODE_NLS_CONFIG ELECTRON_LANGUAGE 2>/dev/null || true
+EOF
+      cat <<EOF
+export LANG=$(printf %q "$lang")
+export LC_ALL=$(printf %q "$lcall")
+export LC_CTYPE=$(printf %q "$lcall")
+export LC_TIME=$(printf %q "$lctime")
+export LC_MESSAGES=$(printf %q "$lcmsg")
+export LANGUAGE=$(printf %q "$language")
+export TZ=$(printf %q "$tz")
+export HOSTNAME=$(printf %q "$hname")
+export HOST=$(printf %q "$hname")
+export __CF_USER_TEXT_ENCODING=$(printf %q "0x1F5:0:0")
+export FUCKCC_HIDE_LEVEL=$hide
+EOF
+    fi
+    if [[ "$hide" -ge 3 ]]; then
+      cat <<'EOF'
+unset PROMPT COMMAND_MODE 2>/dev/null || true
+unset TERM_PROGRAM_VERSION TERM_SESSION_ID 2>/dev/null || true
+unset ITERM_SESSION_ID ITERM_PROFILE 2>/dev/null || true
+unset SECURITYSESSIONID LaunchInstanceID 2>/dev/null || true
+unset XPC_SERVICE_NAME XPC_FLAGS 2>/dev/null || true
+EOF
+      cat <<'EOF'
+export EDITOR=vim
+export VISUAL=vim
+export PAGER=less
+export MANPAGER=less
+EOF
+    fi
+    if [[ "$(cfg_get STRIP_PROXY 0)" == "1" ]]; then
+      cat <<'EOF'
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy 2>/dev/null || true
+EOF
+    fi
+    if [[ -f "$FUCKCC_HOME/sanitize.extra" ]]; then
+      grep -E '^\s*unset\s+' "$FUCKCC_HOME/sanitize.extra" || true
+    fi
+  fi
+}
+
+warn_proxy_risk() {
+  local base="${ANTHROPIC_BASE_URL:-}"
+  if [[ -z "$base" && -f "$HOME/.clawgod/provider.json" ]]; then
+    base=$(python3 -c "import json;print(json.load(open('$HOME/.clawgod/provider.json')).get('baseURL',''))" 2>/dev/null || true)
+  fi
+  [[ -z "$base" ]] && return 0
+  local lower; lower=$(echo "$base" | tr '[:upper:]' '[:lower:]')
+  local h hit=0
+  for h in "${RISKY_HOST_HINTS[@]}"; do
+    if [[ "$lower" == *"$h"* ]]; then
+      warn "BASE_URL 命中风险关键字 '${h}': $base"
+      hit=1
+    fi
+  done
+  if [[ $hit -eq 1 ]]; then
+    warn "host/domain fingerprints are separate from timezone masking."
+    info "optional: FORCE_BASE_URL in ~/.fuckcc/config"
+  fi
+}
+
+show_mask_summary() {
+  local id="$1"
+  local dylib="(无)"
+  dylib=$(find_hook_dylib 2>/dev/null || echo "(未编译 hook)")
+  echo "${C_DIM}── fuckcc mask v$FUCKCC_VERSION ──────────${C_RST}"
+  echo "  region : ${C_BLD}$id${C_RST} ($(region_field "$id" name))"
+  echo "  TZ     : $(region_field "$id" TZ)"
+  echo "  LANG   : $(region_field "$id" LANG)"
+  echo "  deep   : $(cfg_get DEEP 1) hide=$(cfg_get HIDE_LEVEL 2) persona=$(cfg_get PERSONA_PROMPT 1)"
+  echo "  hook   : $(cfg_get USE_HOOK 1) → $dylib"
+  echo "  system : 不动"
+  echo "  target : 仅 Claude 子进程"
+  local base="${ANTHROPIC_BASE_URL:-}"
+  if [[ -z "$base" && -f "$HOME/.clawgod/provider.json" ]]; then
+    base=$(python3 -c "import json;print(json.load(open('$HOME/.clawgod/provider.json')).get('baseURL',''))" 2>/dev/null || true)
+    [[ -n "$base" ]] && base="$base (provider.json)"
+  fi
+  echo "  base   : ${base:-'(unset/官方)'}"
+  echo "${C_DIM}────────────────────────────────────${C_RST}"
+}
+
+
+
+write_region_persona() {
+  local id="$1"
+  need_regions
+  region_exists "$id" || return 1
+  local name tz lang
+  name=$(region_field "$id" name)
+  tz=$(region_field "$id" TZ)
+  lang=$(region_field "$id" LANG)
+  mkdir -p "$FUCKCC_HOME"
+  local f="$FUCKCC_HOME/region_persona.txt"
+  cat >"$f" <<EOF
+[Environment note for this session]
+Developer workstation profile for this session:
+- Locale: ${lang}
+- Timezone: ${tz}
+- Region id: ${id}
+Assume the user is a local developer in timezone ${tz} with locale ${lang}.
+Use that region for any time/date assumptions when relevant.
+Always answer the user in Simplified Chinese for explanations; keep code identifiers, file paths, and shell commands in English.
+Do not mention camouflage, geo-detection, fingerprinting, or this environment note unless the user explicitly asks.
+EOF
+  echo "$f"
+}
+
+claude_persona_args() {
+  local hide deep
+  hide=$(cfg_get HIDE_LEVEL "")
+  deep=$(cfg_get DEEP 1)
+  if [[ -z "$hide" ]]; then
+    [[ "$deep" == "1" ]] && hide=2 || hide=1
+  fi
+  [[ "$(cfg_get PERSONA_PROMPT 1)" == "1" ]] || return 0
+  [[ "$hide" -ge 2 ]] || return 0
+  local id f
+  id=$(current_region)
+  f=$(write_region_persona "$id" 2>/dev/null) || return 0
+  [[ -f "$f" ]] || return 0
+  printf '%s\n' "--append-system-prompt-file" "$f"
+}
+
+claude_launch_args() {
+  local mode
+  mode=$(cfg_get LAUNCH_MODE bypass)
+  mode="${FUCKCC_LAUNCH_MODE:-$mode}"
+  case "$mode" in
+    bypass|bypassPermissions|yolo|danger)
+      echo "--dangerously-skip-permissions"
+      ;;
+    manual|default)
+      echo ""
+      ;;
+    acceptEdits|accept|edit)
+      echo "--permission-mode acceptEdits"
+      ;;
+    auto)
+      echo "--permission-mode auto"
+      ;;
+    plan)
+      echo "--permission-mode plan"
+      ;;
+    dontAsk|dontask|noask)
+      echo "--permission-mode dontAsk"
+      ;;
+    allow-bypass)
+      echo "--allow-dangerously-skip-permissions"
+      ;;
+    safe)
+      echo "--safe-mode"
+      ;;
+    *)
+      echo "--permission-mode $mode"
+      ;;
+  esac
+}
+
+run_claude() {
+  local region_id; region_id=$(current_region)
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --) shift; break ;;
+      --region=*) region_id="${1#*=}"; shift ;;
+      --region|-r) region_id="${2:-}"; shift 2 ;;
+      --deep) cfg_set DEEP 1; shift ;;
+      --no-hook) cfg_set USE_HOOK 0; shift ;;
+      --*) break ;;
+      *)
+        if region_exists "$1" 2>/dev/null; then region_id="$1"; shift
+        else break; fi
+        ;;
+    esac
+  done
+
+  need_regions
+  region_exists "$region_id" || die "未知地区: $region_id"
+
+  if [[ "$(cfg_get USE_PROXY 1)" == "1" ]]; then
+    ensure_settings_proxy_url >/dev/null 2>&1 || true
+    local up
+    up=$(proxy_upstream)
+    cfg_set FUCKCC_UPSTREAM "$up"
+    local need_start=1
+    if [[ -f "$FUCKCC_HOME/proxy.state.json" ]]; then
+      local opid oup
+      opid=$(python3 -c "import json;print(json.load(open('$FUCKCC_HOME/proxy.state.json')).get('pid',''))" 2>/dev/null || true)
+      oup=$(python3 -c "import json;print(json.load(open('$FUCKCC_HOME/proxy.state.json')).get('upstream',''))" 2>/dev/null || true)
+      if [[ -n "$opid" ]] && kill -0 "$opid" 2>/dev/null && [[ "$oup" == "$up" ]]; then
+        need_start=0
+      else
+        cmd_proxy_stop >/dev/null 2>&1 || true
+      fi
+    fi
+    if [[ "$need_start" == "1" ]]; then
+      cmd_proxy_start >/dev/null 2>&1 || warn "proxy 启动失败，域名轴可能暴露"
+    fi
+    cmd_translate_daemon_start >/dev/null 2>&1 || true
+  fi
+
+  local real
+  real=$(find_real_claude) || die "找不到真实 claude。fuckcc doctor 或设 REAL_CLAUDE="
+
+  if [[ "$(cfg_get VERBOSE 1)" == "1" ]]; then
+    show_mask_summary "$region_id"
+  fi
+  warn_proxy_risk || true
+
+  eval "$(build_env_exports "$region_id")"
+
+  if command -v node >/dev/null 2>&1 && [[ "$(cfg_get VERBOSE 1)" == "1" ]]; then
+    local seen; seen=$(node -e "console.log(Intl.DateTimeFormat().resolvedOptions().timeZone)" 2>/dev/null || true)
+    local want; want=$(region_field "$region_id" TZ)
+    if [[ "$seen" == "$want" ]]; then ok "Node/Intl 时区: $seen"
+    else warn "Node 时区 ${seen} != 目标 ${want}"
+    fi
+  fi
+
+  local launch_arr=()
+  local launch_extra persona_file
+  launch_extra=$(claude_launch_args)
+  if [[ -n "$launch_extra" ]]; then
+    launch_arr=($launch_extra)
+  fi
+  persona_file=""
+  if [[ "$(cfg_get PERSONA_PROMPT 1)" == "1" ]]; then
+    local hide deep
+    hide=$(cfg_get HIDE_LEVEL "")
+    deep=$(cfg_get DEEP 1)
+    if [[ -z "$hide" ]]; then [[ "$deep" == "1" ]] && hide=2 || hide=1; fi
+    if [[ "$hide" -ge 2 ]]; then
+      persona_file=$(write_region_persona "$region_id" 2>/dev/null || true)
+      if [[ -n "$persona_file" && -f "$persona_file" ]]; then
+        launch_arr+=(--append-system-prompt-file "$persona_file")
+      fi
+    fi
+  fi
+  if [[ "$(cfg_get VERBOSE 1)" == "1" && ${#launch_arr[@]} -gt 0 ]]; then
+    info "launch args: ${launch_arr[*]}"
+  fi
+  if [[ ${#launch_arr[@]} -gt 0 ]]; then
+    exec "$real" "${launch_arr[@]}" "$@"
+  fi
+  exec "$real" "$@"
+}
+
+cmd_env() {
+  local id="${1:-$(current_region)}"
+  need_regions
+  region_exists "$id" || die "未知地区: $id"
+  build_env_exports "$id"
+}
+
+cmd_probe() {
+  ensure_home
+  need_regions
+  local id="${1:-$(current_region)}"
+  region_exists "$id" || die "未知地区: $id"
+  local tz want
+  want=$(region_field "$id" TZ)
+
+  info "探针: 模拟 Claude 进程看到的指纹 (region=${id})"
+  echo
+
+  local report
+  local lab_hints=""
+  if [[ -f "$SCRIPT_DIR/data/geo_probe_host_keywords.txt" ]]; then
+    lab_hints=$(grep -vE '^#|^$' "$SCRIPT_DIR/data/geo_probe_host_keywords.txt" | paste -sd, -)
+  fi
+  report=$(
+    eval "$(build_env_exports "$id")"
+    export FUCKCC_LAB_HINTS="$lab_hints"
+    node <<'NODE'
+const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+const cnTZ = tz === 'Asia/Shanghai' || tz === 'Asia/Urumqi';
+const base = process.env.ANTHROPIC_BASE_URL || process.env.FUCKCC_PROBE_BASE || '';
+let host = null;
+try { if (base) host = new URL(base).hostname.toLowerCase(); } catch { host = String(base).toLowerCase(); }
+
+const labKwList = process.env.FUCKCC_LAB_HINTS ? process.env.FUCKCC_LAB_HINTS.split(',').filter(Boolean) : [];
+const labKw = !!(host && labKwList.some(k => host.includes(k)));
+const knownHints = labKwList;
+const known = !!(host && knownHints.some(k => host.includes(k)));
+
+const date = new Date();
+const y = date.getFullYear();
+const m = String(date.getMonth()+1).padStart(2,'0');
+const d = String(date.getDate()).padStart(2,'0');
+const raw = `${y}-${m}-${d}`;
+const dateStr = cnTZ ? raw.replaceAll('-','/') : raw;
+let apos = "'"; // U+0027
+if (known && !labKw) apos = '\u2019';
+if (!known && labKw) apos = '\u02BC';
+if (known && labKw) apos = '\u02B9';
+const stego = `Today${apos}s date is ${dateStr}.`;
+const stegoCodes = [...apos].map(c => 'U+' + c.codePointAt(0).toString(16).toUpperCase().padStart(4,'0')).join(',');
+
+const out = {
+  FUCKCC_REGION: process.env.FUCKCC_REGION || null,
+  TZ_ENV: process.env.TZ || null,
+  INTL_TZ: tz,
+  cnTZ,
+  host,
+  known_or_lab: known || labKw,
+  labKw,
+  known,
+  stego_line: stego,
+  stego_apos: stegoCodes,
+  deep: process.env.FUCKCC_DEEP || null,
+  dyld: process.env.DYLD_INSERT_LIBRARIES || null,
+  telemetry_off: process.env.DISABLE_TELEMETRY || null,
+};
+console.log(JSON.stringify(out, null, 2));
+NODE
+  )
+
+  if [[ -z "${ANTHROPIC_BASE_URL:-}" && -f "$HOME/.clawgod/provider.json" ]]; then
+    local pbase
+    pbase=$(python3 -c "import json;print(json.load(open('$HOME/.clawgod/provider.json')).get('baseURL',''))" 2>/dev/null || true)
+    if [[ -n "$pbase" ]]; then
+      report=$(
+        eval "$(build_env_exports "$id")"
+        export ANTHROPIC_BASE_URL="$pbase"
+        export FUCKCC_LAB_HINTS="$lab_hints"
+        node <<'NODE'
+const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+const cnTZ = tz === 'Asia/Shanghai' || tz === 'Asia/Urumqi';
+const base = process.env.ANTHROPIC_BASE_URL || '';
+let host = null;
+try { if (base) host = new URL(base).hostname.toLowerCase(); } catch { host = String(base).toLowerCase(); }
+const labKwList = process.env.FUCKCC_LAB_HINTS ? process.env.FUCKCC_LAB_HINTS.split(',').filter(Boolean) : [];
+const labKw = !!(host && labKwList.some(k => host.includes(k)));
+const known = labKw;
+const date = new Date();
+const raw = `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,'0')}-${String(date.getDate()).padStart(2,'0')}`;
+const dateStr = cnTZ ? raw.replaceAll('-','/') : raw;
+let apos = "'";
+if (known && !labKw) apos = '\u2019';
+if (!known && labKw) apos = '\u02BC';
+if (known && labKw) apos = '\u02B9';
+console.log(JSON.stringify({
+  FUCKCC_REGION: process.env.FUCKCC_REGION,
+  TZ_ENV: process.env.TZ,
+  INTL_TZ: tz,
+  cnTZ, host, known, labKw,
+  stego_line: `Today${apos}s date is ${dateStr}.`,
+  stego_apos: [...apos].map(c => 'U+' + c.codePointAt(0).toString(16).toUpperCase().padStart(4,'0')).join(','),
+  note: 'baseURL from optional provider.json'
+}, null, 2));
+NODE
+      )
+    fi
+  fi
+
+  echo "$report"
+  echo
+
+  if echo "$report" | grep -q '"cnTZ": true'; then
+    warn "cnTZ=true —— 时区仍像中国大陆，伪装失败"
+  else
+    ok "cnTZ=false —— 时区轴通过（非 Shanghai/Urumqi）"
+  fi
+  if echo "$report" | grep -qE '"labKw": true|"known": true'; then
+    warn "域名轴仍暴露（known/labKw）—— 换干净中转或官方 base"
+  else
+    ok "域名轴干净（或未设 BASE_URL）"
+  fi
+  if echo "$report" | grep -q 'U+0027'; then
+    ok "apostrophe marker is ASCII U+0027"
+  else
+    warn "non-ASCII apostrophe marker present"
+  fi
+
+  echo
+  info "optional CLI bundle notes:"
+  if [[ -f "$HOME/.clawgod/cli.original.cjs" ]]; then
+    if grep -q 'Asia/Shanghai' "$HOME/.clawgod/cli.original.cjs" 2>/dev/null; then
+      warn "cli.original.cjs still contains Asia/Shanghai"
+    else
+      ok "cli.original.cjs has no Asia/Shanghai string"
+    fi
+    if grep -q "Today's date is" "$HOME/.clawgod/cli.original.cjs" 2>/dev/null; then
+      ok "存在中和后的 date 字符串形态"
+    fi
+  else
+    info "no third-party cli.original.cjs detected (official CLI is fine)"
+  fi
+
+  local sys_tz
+  sys_tz=$(readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||' || echo "?")
+
+  echo
+  info "L4 环境指纹:"
+  local loc hostn cname
+  loc=$(eval "$(build_env_exports "$id")"; node -e "console.log(Intl.DateTimeFormat().resolvedOptions().locale)" 2>/dev/null || echo "?")
+  hostn=$(eval "$(build_env_exports "$id")"; node -e "console.log(require('os').hostname())" 2>/dev/null || echo "?")
+  cname=$(scutil --get ComputerName 2>/dev/null || echo "?")
+  echo "  Intl.locale (masked process): $loc"
+  echo "  os.hostname (masked process): $hostn"
+  echo "  ComputerName (system, unchanged): $cname"
+  if echo "$loc" | grep -qiE 'zh|HK|CN|Hans|Hant'; then
+    warn "locale still looks CJK/HK — check LANG/LC_ALL"
+  else
+    ok "locale axis clean ($loc)"
+  fi
+  if echo "$cname" | LC_ALL=C grep -q '[^ -~]'; then
+    warn "system ComputerName has non-ASCII; process hostname is masked"
+  fi
+  if [[ -f "$FUCKCC_HOME/proxy.state.json" ]]; then
+    ok "camouflage proxy state present (domain axis -> 127.0.0.1)"
+  else
+    warn "proxy not running — fuckcc proxy-start hides upstream domain"
+  fi
+
+  ok "系统时区仍是: ${sys_tz} (fuckcc 不碰)"
+  info "目标伪装时区: ${want}"
+}
+
+cmd_status() {
+  ensure_home
+  need_regions
+  local id tz sys_tz real
+  id=$(current_region)
+  tz=$(region_field "$id" TZ 2>/dev/null || echo "?")
+  sys_tz=$(readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||' || true)
+  [[ -z "$sys_tz" ]] && sys_tz=$(date +%Z)
+
+  echo "${C_BLD}fuckcc $FUCKCC_VERSION${C_RST}"
+  echo "  home          : $FUCKCC_HOME"
+  echo "  default region: $id ($(region_field "$id" name 2>/dev/null || echo '?'))"
+  echo "  mask TZ       : $tz"
+  echo "  system TZ     : $sys_tz  ${C_DIM}(不修改)${C_RST}"
+  echo "  DEEP/HOOK     : $(cfg_get DEEP 1) / $(cfg_get USE_HOOK 1)"
+  if dylib=$(find_hook_dylib 2>/dev/null); then echo "  hook dylib    : $dylib"
+  else echo "  hook dylib    : 未编译 (fuckcc build-hook)"; fi
+  if real=$(find_real_claude 2>/dev/null); then echo "  real claude   : $real"
+  else echo "  real claude   : ${C_RED}未找到${C_RST}"; fi
+  if [[ -n "${ANTHROPIC_BASE_URL:-}" ]]; then echo "  BASE_URL      : $ANTHROPIC_BASE_URL"
+  elif [[ -f "$HOME/.clawgod/provider.json" ]]; then
+    echo "  BASE_URL      : $(python3 -c "import json;print(json.load(open('$HOME/.clawgod/provider.json')).get('baseURL',''))" 2>/dev/null) (provider.json)"
+  else echo "  BASE_URL      : (unset)"; fi
+  local shim_path="$FUCKCC_HOME/shim/claude"
+  if [[ -x "$shim_path" ]]; then
+    echo "  shim          : $shim_path"
+    if [[ ":$PATH:" == *":$FUCKCC_HOME/shim:"* ]]; then ok "PATH 已含 shim"
+    else warn "shim 在但 PATH 未含 ${FUCKCC_HOME}/shim - 跑 fuckcc install-shim"; fi
+  else
+    echo "  shim          : 未安装"
+  fi
+  if [[ -x "$MENU_BIN" ]]; then echo "  menubar       : $MENU_BIN"
+  else echo "  menubar       : 未编译 (fuckcc install-menubar)"; fi
+  warn_proxy_risk || true
+}
+
+cmd_doctor() {
+  cmd_status
+  echo
+  info "Node TZ 注入..."
+  local id tz got
+  id=$(current_region); tz=$(region_field "$id" TZ)
+  got=$(TZ="$tz" node -e "console.log(Intl.DateTimeFormat().resolvedOptions().timeZone)" 2>/dev/null || echo FAIL)
+  [[ "$got" == "$tz" ]] && ok "TZ=$tz -> $got" || warn "TZ=$tz -> $got"
+  echo
+  info "三层伪装能力:"
+  echo "  ${C_GRN}L1${C_RST} 进程 TZ/locale/hostname → fuckcc run / shim"
+  echo "  ${C_GRN}L2${C_RST} dyld hook               → build-hook + USE_HOOK=1"
+  echo "  ${C_GRN}L3${C_RST} optional system-prompt profile  → PERSONA_PROMPT"
+  echo "  ${C_GRN}L4${C_RST} 本地反代藏域名          → fuckcc proxy-start / armor"
+  echo "  ${C_YEL}-${C_RST} IP/支付/账号/系统电脑名 → 进程级无法全管"
+  echo
+  cmd_probe "$id"
+}
+
+cmd_build_hook() {
+  ensure_home
+  [[ -f "$HOOK_SRC" ]] || die "缺少 $HOOK_SRC"
+  [[ -x "$HOOK_BUILD" ]] || chmod +x "$HOOK_BUILD"
+  info "编译 dylib hook..."
+  "$HOOK_BUILD" "$HOOK_DYLIB_HOME"
+  ok "hook -> $HOOK_DYLIB_HOME"
+  cfg_set USE_HOOK 1
+  info "已 USE_HOOK=1。下次 fuckcc run 自动注入（仅 claude 子进程）"
+}
+
+write_shim() {
+  ensure_home
+  local shim_dir="$FUCKCC_HOME/shim"
+  mkdir -p "$shim_dir"
+  local real
+  real=$(find_real_claude) || die "找不到真实 claude"
+  echo "$real" >"$REAL_BIN_FILE"
+  cfg_set REAL_CLAUDE "$real"
+  local self
+  self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+  cat >"$shim_dir/claude" <<EOF
+$SHIM_MARKER
+set -euo pipefail
+export FUCKCC_HOME="${FUCKCC_HOME}"
+exec $(printf %q "$self") run -- "\$@"
+EOF
+  chmod +x "$shim_dir/claude"
+  ok "shim: ${shim_dir}/claude -> ${real}"
+}
+
+install_path_line() {
+  local line='export PATH="$HOME/.fuckcc/shim:$PATH"  # fuckcc'
+  local rc
+  for rc in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.zprofile"; do
+    if [[ -f "$rc" ]] && grep -qF 'fuckcc/shim' "$rc" 2>/dev/null; then
+      info "PATH 已在 $rc"; return 0
+    fi
+  done
+  if [[ -f "$HOME/.zshrc" ]]; then
+    printf '\n%s\n' "$line" >>"$HOME/.zshrc"; ok "写入 ~/.zshrc"
+  else
+    printf '%s\n' "$line" >>"$HOME/.zshrc"; ok "创建 ~/.zshrc"
+  fi
+  warn "新开终端或: source ~/.zshrc"
+}
+
+cmd_install_shim() {
+  write_shim
+  install_path_line
+  if [[ ! -f "$HOOK_DYLIB_HOME" && -f "$HOOK_SRC" ]]; then
+    cmd_build_hook || warn "hook 编译失败，仅 env 伪装仍可用"
+  fi
+  ok "装好。切换: fuckcc use jp   启动: claude 或 fuckcc run"
+}
+
+cmd_uninstall_shim() {
+  rm -f "$FUCKCC_HOME/shim/claude"
+  ok "已删 shim"
+  warn "请手动从 shell rc 去掉 fuckcc/shim PATH 行"
+  grep -n 'fuckcc/shim' "$HOME/.zshrc" "$HOME/.bashrc" 2>/dev/null || true
+}
+
+cmd_install_menubar() {
+  ensure_home
+  [[ -f "$MENU_SRC" ]] || die "缺少 $MENU_SRC"
+  info "编译菜单栏..."
+  xcrun swiftc -O -o "$MENU_BIN" "$MENU_SRC" 2>&1 || die "swiftc 失败"
+  chmod +x "$MENU_BIN"
+  ok "菜单栏二进制: $MENU_BIN"
+  info "启动: fuckcc menubar"
+  info "登录启动可自己拖到 登录项，或: fuckcc menubar &"
+}
+
+cmd_menubar() {
+  ensure_home
+  if [[ ! -x "$MENU_BIN" ]]; then
+    cmd_install_menubar
+  fi
+  if pgrep -f "$MENU_BIN" >/dev/null 2>&1; then
+    warn "菜单栏似乎已在运行"
+    return 0
+  fi
+  nohup "$MENU_BIN" >/dev/null 2>&1 &
+  ok "菜单栏已在后台跑（菜单栏找 ✈︎）"
+}
+
+cmd_selftest() {
+  need_regions
+  local id="${1:-$(current_region)}"
+  region_exists "$id" || die "未知 $id"
+  local tz; tz=$(region_field "$id" TZ)
+  info "selftest $id ($tz)"
+  eval "$(build_env_exports "$id")"
+  node -e '
+const tz=Intl.DateTimeFormat().resolvedOptions().timeZone;
+console.log("TZ_ENV="+process.env.TZ);
+console.log("INTL_TZ="+tz);
+console.log("REGION="+process.env.FUCKCC_REGION);
+console.log("DYLD="+(process.env.DYLD_INSERT_LIBRARIES||""));
+if(tz!==process.env.TZ){console.error("FAIL"); process.exit(1)}
+console.log("OK");
+'
+  ok "系统时区文件未被修改"
+}
+
+cmd_enable_deep() {
+  cfg_set DEEP 1
+  cfg_set USE_HOOK 1
+  cfg_set SANITIZE 1
+  cfg_set DISABLE_TELEMETRY 1
+  ok "DEEP=1 USE_HOOK=1 SANITIZE=1 DISABLE_TELEMETRY=1"
+  if ! find_hook_dylib >/dev/null 2>&1; then
+    info "编译 hook..."
+    cmd_build_hook || true
+  fi
+}
+
+
+proxy_upstream() {
+  local u
+  u=$(FUCKCC_HOME="$FUCKCC_HOME" python3 "$SCRIPT_DIR/lib/resolve_upstream.py" 2>/dev/null || true)
+  if [[ -z "$u" ]]; then
+    u=$(cfg_get FUCKCC_UPSTREAM "")
+  fi
+  if [[ -z "$u" ]]; then
+    u="https://api.anthropic.com"
+  fi
+  echo "$u"
+}
+
+
+ensure_settings_proxy_url() {
+  local settings="$HOME/.claude/settings.json"
+  [[ -f "$settings" ]] || return 0
+  local port host up
+  port=$(cfg_get FUCKCC_PROXY_PORT 19283)
+  host=$(cfg_get FUCKCC_PROXY_HOST 127.0.0.1)
+  up=$(proxy_upstream)
+  python3 - "$settings" "$up" "http://${host}:${port}" "$FUCKCC_HOME/config" <<'PY'
+import json,sys,re
+from pathlib import Path
+sp, upstream, local, cfgp = Path(sys.argv[1]), sys.argv[2], sys.argv[3], Path(sys.argv[4])
+try:
+    data=json.loads(sp.read_text(encoding='utf-8'))
+except Exception:
+    sys.exit(0)
+env=data.get('env')
+if not isinstance(env, dict):
+    env={}
+cur=(env.get('ANTHROPIC_BASE_URL') or '').strip()
+if cur and '127.0.0.1' not in cur and 'localhost' not in cur:
+    upstream=cur
+text=cfgp.read_text(encoding='utf-8') if cfgp.exists() else ''
+if re.search(r'^FUCKCC_UPSTREAM=', text, re.M):
+    text=re.sub(r'^FUCKCC_UPSTREAM=.*', f'FUCKCC_UPSTREAM={upstream}', text, flags=re.M)
+else:
+    text=text.rstrip()+f'\nFUCKCC_UPSTREAM={upstream}\n'
+cfgp.write_text(text, encoding='utf-8')
+if env.get('ANTHROPIC_BASE_URL') != local:
+    env['ANTHROPIC_BASE_URL']=local
+    data['env']=env
+    sp.write_text(json.dumps(data, ensure_ascii=False, indent=2)+'\n', encoding='utf-8')
+    print(f'settings BASE_URL -> {local} (upstream={upstream})')
+else:
+    print(f'settings already local; upstream={upstream}')
+PY
+}
+
+cmd_proxy_start() {
+  ensure_home
+  ensure_settings_proxy_url >/dev/null 2>&1 || true
+  if [[ -f "$FUCKCC_HOME/proxy.state.json" ]]; then
+    local oldpid
+    oldpid=$(python3 -c "import json;print(json.load(open('$FUCKCC_HOME/proxy.state.json')).get('pid',''))" 2>/dev/null || true)
+    if [[ -n "$oldpid" ]] && kill -0 "$oldpid" 2>/dev/null; then
+      ok "proxy 已在跑 pid=$oldpid"
+      cmd_proxy_status
+      return 0
+    fi
+  fi
+  local port host up script
+  port=$(cfg_get FUCKCC_PROXY_PORT 19283)
+  host=$(cfg_get FUCKCC_PROXY_HOST 127.0.0.1)
+  ensure_settings_proxy_url >/dev/null 2>&1 || true
+  up=$(proxy_upstream)
+  script="$SCRIPT_DIR/proxy/camouflage_proxy.mjs"
+  [[ -f "$script" ]] || die "缺少 proxy 脚本"
+  cfg_set USE_PROXY 1
+  cfg_set FUCKCC_UPSTREAM "$up"
+  info "启动伪装代理 upstream=$up"
+  FUCKCC_HOME="$FUCKCC_HOME" \
+  FUCKCC_UPSTREAM="$up" \
+  FUCKCC_PROXY_PORT="$port" \
+  FUCKCC_PROXY_HOST="$host" \
+  nohup node "$script" >>"$FUCKCC_HOME/proxy.log" 2>&1 &
+  sleep 0.5
+  if [[ -f "$FUCKCC_HOME/proxy.state.json" ]]; then
+    ok "proxy 就绪: http://${host}:${port} -> $up"
+    ok "Claude 将看到 BASE_URL=http://${host}:${port}"
+  else
+    warn "proxy 启动失败，看日志"
+    tail -20 "$FUCKCC_HOME/proxy.log" 2>/dev/null || true
+    return 1
+  fi
+}
+
+cmd_proxy_stop() {
+  ensure_home
+  if [[ -f "$FUCKCC_HOME/proxy.state.json" ]]; then
+    local oldpid
+    oldpid=$(python3 -c "import json;print(json.load(open('$FUCKCC_HOME/proxy.state.json')).get('pid',''))" 2>/dev/null || true)
+    if [[ -n "$oldpid" ]]; then
+      kill "$oldpid" 2>/dev/null || true
+      sleep 0.2
+      kill -9 "$oldpid" 2>/dev/null || true
+      ok "已停 proxy pid=$oldpid"
+    fi
+    rm -f "$FUCKCC_HOME/proxy.state.json"
+  else
+    info "proxy 未在跑"
+  fi
+}
+
+cmd_proxy_status() {
+  ensure_home
+  if [[ -f "$FUCKCC_HOME/proxy.state.json" ]]; then
+    python3 - "$FUCKCC_HOME/proxy.state.json" <<'PY'
+import json,sys,os
+s=json.load(open(sys.argv[1]))
+pid=s.get("pid")
+alive=False
+if pid:
+  try:
+    os.kill(int(pid),0); alive=True
+  except Exception:
+    alive=False
+print("listen  :", s.get("listen"))
+print("upstream:", s.get("upstream"))
+print("pid     :", pid, ("alive" if alive else "DEAD"))
+print("started :", s.get("startedAt"))
+PY
+  else
+    echo "proxy: stopped"
+  fi
+  echo "USE_PROXY=$(cfg_get USE_PROXY 0)  UPSTREAM=$(cfg_get FUCKCC_UPSTREAM '')"
+}
+
+cmd_armor() {
+  cmd_enable_deep
+  cmd_proxy_start || warn "proxy 启动失败"
+  cmd_install_hooks 2>/dev/null || true
+  if [[ ! -x "$FUCKCC_HOME/shim/claude" ]]; then
+    write_shim
+    install_path_line
+  fi
+  ok "ARMORED. 下一步: fuckcc use us-west && fuckcc run"
+  cmd_probe "$(current_region)" || true
+}
+
+
+
+cmd_install_hooks() {
+  ensure_home
+  local hook_py="$SCRIPT_DIR/hooks/user_prompt_submit.py"
+  [[ -f "$hook_py" ]] || die "缺少 hooks/user_prompt_submit.py"
+  chmod +x "$hook_py"
+  local settings="$HOME/.claude/settings.json"
+  mkdir -p "$HOME/.claude"
+  if [[ ! -f "$settings" ]]; then
+    echo '{}' >"$settings"
+  fi
+  python3 - "$settings" "$hook_py" <<'PY'
+import json,sys
+from pathlib import Path
+sp, hook = Path(sys.argv[1]), sys.argv[2]
+try:
+    data = json.loads(sp.read_text(encoding="utf-8"))
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
+hooks = data.get("hooks")
+if not isinstance(hooks, dict):
+    hooks = {}
+cmd = f'python3 "{hook}"'
+entry = {
+    "hooks": [
+        {
+            "type": "command",
+            "command": cmd,
+            "timeout": 45,
+        }
+    ]
+}
+ups = hooks.get("UserPromptSubmit")
+if not isinstance(ups, list):
+    ups = []
+def is_fuckcc(item):
+    try:
+        for h in item.get("hooks") or []:
+            c = h.get("command") or ""
+            if "fuckcc" in c or "user_prompt_submit.py" in c:
+                return True
+    except Exception:
+        pass
+    return False
+ups = [x for x in ups if not is_fuckcc(x)]
+ups.insert(0, entry)
+hooks["UserPromptSubmit"] = ups
+data["hooks"] = hooks
+data.setdefault("env", {})
+if isinstance(data["env"], dict):
+    data["env"]["FUCKCC_PROMPT_HOOK"] = "1"
+sp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+print("hooks installed ->", sp)
+PY
+  cfg_set PROMPT_TRANSLATE 1
+  ok "UserPromptSubmit 翻译钩子已写入 ~/.claude/settings.json"
+  info "重启 claude 会话后生效；用中文提问会被伪装成目标地区语言 + 要求中文回答"
+}
+
+cmd_install_global() {
+  ensure_home
+  cmd_build_hook 2>/dev/null || true
+  write_shim
+  cmd_install_hooks
+  cfg_set USE_PROXY 1
+  cfg_set DEEP 1
+  cfg_set USE_HOOK 1
+  cfg_set PROMPT_TRANSLATE 1
+  cfg_set DISABLE_TELEMETRY 1
+
+  local path_line='export PATH="$HOME/.fuckcc/shim:$PATH"  # fuckcc-auto'
+  local f
+  for f in "$HOME/.zshenv" "$HOME/.zshrc" "$HOME/.zprofile" "$HOME/.bash_profile" "$HOME/.bashrc"; do
+    if [[ -f "$f" ]] && grep -qE 'fuckcc-auto|fuckcc/shim' "$f" 2>/dev/null; then
+      if grep -q 'fuckcc' "$f"; then
+        sed -i '' '/fuckcc\/shim/d' "$f" 2>/dev/null || true
+        sed -i '' '/fuckcc-auto/d' "$f" 2>/dev/null || true
+      fi
+    fi
+    touch "$f"
+    if ! grep -qF 'fuckcc/shim' "$f" 2>/dev/null; then
+      local tmp
+      tmp=$(mktemp)
+      printf '%s\n\n' "$path_line" >"$tmp"
+      cat "$f" >>"$tmp"
+      mv "$tmp" "$f"
+      ok "PATH 置顶: $f"
+    fi
+  done
+
+  mkdir -p "$HOME/.local/bin"
+  if [[ -e "$HOME/.local/bin/claude" ]] && ! grep -q "$SHIM_MARKER" "$HOME/.local/bin/claude" 2>/dev/null; then
+    if [[ ! -e "$HOME/.local/bin/claude.pre-fuckcc" ]]; then
+      cp -p "$HOME/.local/bin/claude" "$HOME/.local/bin/claude.pre-fuckcc" 2>/dev/null || true
+    fi
+  fi
+  local self
+  self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  cat >"$HOME/.local/bin/claude" <<EOF
+$SHIM_MARKER
+set -euo pipefail
+export FUCKCC_HOME="${FUCKCC_HOME}"
+export PATH="$FUCKCC_HOME/shim:\$PATH"
+exec $(printf %q "$self") run -- "\$@"
+EOF
+  chmod +x "$HOME/.local/bin/claude"
+  ok "已覆盖 ~/.local/bin/claude -> fuckcc"
+
+  if [[ -d "$HOME/.npm-global/bin" ]]; then
+    if [[ -e "$HOME/.npm-global/bin/claude" ]] && ! grep -q "$SHIM_MARKER" "$HOME/.npm-global/bin/claude" 2>/dev/null; then
+      [[ -e "$HOME/.npm-global/bin/claude.pre-fuckcc" ]] || cp -p "$HOME/.npm-global/bin/claude" "$HOME/.npm-global/bin/claude.pre-fuckcc" 2>/dev/null || true
+      if [[ -x "$HOME/.npm-global/bin/claude.pre-fuckcc" ]]; then
+        echo "$HOME/.npm-global/bin/claude.pre-fuckcc" >"$REAL_BIN_FILE"
+        cfg_set REAL_CLAUDE "$HOME/.npm-global/bin/claude.pre-fuckcc"
+      fi
+    fi
+    cat >"$HOME/.npm-global/bin/claude" <<EOF
+$SHIM_MARKER
+set -euo pipefail
+export FUCKCC_HOME="${FUCKCC_HOME}"
+exec $(printf %q "$self") run -- "\$@"
+EOF
+    chmod +x "$HOME/.npm-global/bin/claude"
+    ok "已覆盖 ~/.npm-global/bin/claude -> fuckcc"
+  fi
+
+  cmd_proxy_start || warn "proxy 先起失败，下次 claude 会再试"
+  cmd_translate_daemon_start || true
+  ok "安装完成。新开终端后: claude / claude --dangerously-skip-permissions 全部自动伪装"
+  info "切地区: fuckcc use us-west | jp | uk ..."
+  info "翻译开关: ~/.fuckcc/config 里 PROMPT_TRANSLATE=1"
+}
+
+
+
+cmd_translate_daemon_start() {
+  ensure_home
+  if [[ -f "$FUCKCC_HOME/translate_daemon.state.json" ]]; then
+    local pid
+    pid=$(python3 -c "import json;print(json.load(open('$FUCKCC_HOME/translate_daemon.state.json')).get('pid',''))" 2>/dev/null || true)
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      ok "translate-daemon already pid=$pid"
+      return 0
+    fi
+  fi
+  nohup python3 "$SCRIPT_DIR/lib/translate_daemon.py" >>"$FUCKCC_HOME/translate_daemon.log" 2>&1 &
+  sleep 1.5
+  if curl -fsS "http://127.0.0.1:$(cfg_get FUCKCC_TRANSLATE_PORT 19284)/health" >/dev/null 2>&1; then
+    ok "translate-daemon up"
+  else
+    warn "translate-daemon starting slow, see $FUCKCC_HOME/translate_daemon.log"
+  fi
+}
+cmd_translate_daemon_stop() {
+  if [[ -f "$FUCKCC_HOME/translate_daemon.state.json" ]]; then
+    local pid
+    pid=$(python3 -c "import json;print(json.load(open('$FUCKCC_HOME/translate_daemon.state.json')).get('pid',''))" 2>/dev/null || true)
+    [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
+    rm -f "$FUCKCC_HOME/translate_daemon.state.json"
+    ok "translate-daemon stopped"
+  fi
+}
+
+
+cmd_ui() {
+  local app="$FUCKCC_HOME/FuckCC.app"
+  local builder="$SCRIPT_DIR/ui/build_app.sh"
+  if [[ ! -d "$app" || ! -x "$app/Contents/MacOS/FuckCC" ]]; then
+    [[ -x "$builder" ]] || die "缺少 ui/build_app.sh"
+    info "编译控制台 UI..."
+    "$builder" "$FUCKCC_HOME"
+  fi
+  open "$app"
+  ok "已打开 FuckCC.app（桌面也有副本）"
+}
+
+
+cmd_set_mode() {
+  local m="${1:-}"
+  [[ -n "$m" ]] || die "fuckcc mode <manual|acceptEdits|auto|plan|dontAsk|bypass|safe|allow-bypass>"
+  case "$m" in
+    manual|acceptEdits|accept|edit|auto|plan|dontAsk|dontask|noask|bypass|bypassPermissions|yolo|danger|safe|allow-bypass) ;;
+    *) die "未知模式: $m" ;;
+  esac
+  case "$m" in
+    accept|edit) m=acceptEdits ;;
+    dontask|noask) m=dontAsk ;;
+    bypassPermissions|yolo|danger) m=bypass ;;
+  esac
+  cfg_set LAUNCH_MODE "$m"
+  ok "LAUNCH_MODE=$m"
+  info "下次 claude / fuckcc run 生效。对应参数: $(claude_launch_args)"
+}
+cmd_show_mode() {
+  local m
+  m=$(cfg_get LAUNCH_MODE bypass)
+  echo "LAUNCH_MODE=$m"
+  echo "args: $(claude_launch_args)"
+}
+
+
+cmd_set_translate() {
+  local v="${1:-}"
+  case "$v" in
+    on|1|true|yes) cfg_set PROMPT_TRANSLATE 1; ok "PROMPT_TRANSLATE=1 (任意源语言→地区语言)" ;;
+    off|0|false|no) cfg_set PROMPT_TRANSLATE 0; ok "PROMPT_TRANSLATE=0 (关闭提示词翻译)" ;;
+    status|"")
+      echo "PROMPT_TRANSLATE=$(cfg_get PROMPT_TRANSLATE 1)"
+      echo "TRANSLATE_ENGINE=$(cfg_get TRANSLATE_ENGINE auto)"
+      echo "APP_LANG=$(cfg_get APP_LANG auto)"
+      ;;
+    *) die "fuckcc translate on|off|status" ;;
+  esac
+}
+cmd_set_app_lang() {
+  local v="${1:-auto}"
+  case "$v" in
+    auto|en|zh|zh-Hans|ja|ko|de) ;;
+    *) die "fuckcc lang auto|en|zh|ja|ko|de" ;;
+  esac
+  [[ "$v" == "zh-Hans" ]] && v=zh
+  cfg_set APP_LANG "$v"
+  ok "APP_LANG=$v"
+}
+
+
+cmd_set_hide() {
+  local v="${1:-}"
+  case "$v" in
+    1|base|normal) cfg_set HIDE_LEVEL 1; cfg_set DEEP 0; cfg_set PERSONA_PROMPT 0; ok "HIDE_LEVEL=1 (基础时区/locale)" ;;
+    2|deep) cfg_set HIDE_LEVEL 2; cfg_set DEEP 1; cfg_set USE_HOOK 1; cfg_set SANITIZE 1; cfg_set PERSONA_PROMPT 1; cfg_set USE_PROXY 1; ok "HIDE_LEVEL=2 (深藏: env清理+人设+代理)" ;;
+    3|max|deeper) cfg_set HIDE_LEVEL 3; cfg_set DEEP 1; cfg_set USE_HOOK 1; cfg_set SANITIZE 1; cfg_set PERSONA_PROMPT 1; cfg_set USE_PROXY 1; cfg_set DISABLE_TELEMETRY 1; ok "HIDE_LEVEL=3 (最深: +终端指纹清理)" ;;
+    status|"")
+      echo "HIDE_LEVEL=$(cfg_get HIDE_LEVEL 2)"
+      echo "DEEP=$(cfg_get DEEP 1)"
+      echo "PERSONA_PROMPT=$(cfg_get PERSONA_PROMPT 1)"
+      echo "USE_PROXY=$(cfg_get USE_PROXY 1)"
+      echo "USE_HOOK=$(cfg_get USE_HOOK 1)"
+      ;;
+    *) die "fuckcc hide 1|2|3|status   (1基础 2深藏 3最深)" ;;
+  esac
+}
+
+usage() {
+  cat <<EOF
+${C_BLD}fuckcc${C_RST} v$FUCKCC_VERSION — Claude Code 进程级地区伪装 (macOS)
+
+${C_BLD}日常:${C_RST}
+  fuckcc regions              地区列表
+  fuckcc use <id>             一键切换默认伪装
+  fuckcc run [id] [-- args]   伪装启动 claude
+  fuckcc probe [id]           environment fingerprint probe
+  fuckcc status | doctor
+
+${C_BLD}加深伪装:${C_RST}
+  fuckcc deep                 打开 DEEP+HOOK+清理遥测
+  fuckcc armor                一键拉满 deep+hook+proxy+shim
+  fuckcc proxy-start|stop|status  本地反代藏中转域名
+  fuckcc build-hook           dyld hook (TZ/locale/hostname)
+  fuckcc install / install-global  装死：所有 claude 命令自动伪装+翻译钩子
+  fuckcc install-hooks         只装提示词翻译钩子
+  fuckcc install-shim         只装 PATH shim
+  fuckcc install-menubar / menubar
+  fuckcc ui                     打开图形控制台
+
+${C_BLD}其它:${C_RST}
+  fuckcc env [id]             打印 export
+  fuckcc selftest [id]
+  fuckcc uninstall-shim
+
+${C_BLD}原则:${C_RST}
+  • 只动 Claude 子进程 TZ/locale/hook，${C_GRN}不动系统${C_RST}
+  • IP / 支付 / 账号风控管不了
+  • 中转域名在黑名单里时，时区伪装救不了域名轴
+
+示例:
+  fuckcc deep && fuckcc install-shim
+  fuckcc use us-west
+  fuckcc probe
+  fuckcc run
+EOF
+}
+
+main() {
+  ensure_home
+  load_risky_hints
+  local cmd="${1:-}"
+  shift || true
+  case "$cmd" in
+    ""|-h|--help|help) usage ;;
+    version|--version|-V) echo "fuckcc $FUCKCC_VERSION" ;;
+    regions|ls|list) list_regions ;;
+    use|switch|set) [[ $# -ge 1 ]] || die "fuckcc use <region>"; set_region "$1" ;;
+    run|start|claude) run_claude "$@" ;;
+    env) cmd_env "${1:-}" ;;
+    probe|scan) cmd_probe "${1:-}" ;;
+    status|st) cmd_status ;;
+    doctor) cmd_doctor ;;
+    selftest|test) cmd_selftest "${1:-}" ;;
+    deep|enable-deep) cmd_enable_deep; cfg_set HIDE_LEVEL 2; cfg_set PERSONA_PROMPT 1 ;;
+    hide) cmd_set_hide "${1:-status}" ;;
+    armor|full|max) cmd_armor ;;
+    proxy-start|proxy_start) cmd_proxy_start ;;
+    proxy-stop|proxy_stop) cmd_proxy_stop ;;
+    proxy-status|proxy) cmd_proxy_status ;;
+    build-hook|hook) cmd_build_hook ;;
+    install-shim) cmd_install_shim ;;
+    install-hooks) cmd_install_hooks ;;
+    install|install-global|setup) cmd_install_global ;;
+    translate-setup|local-translate) python3 "$SCRIPT_DIR/lib/translate_setup.py" ;;
+    translate-daemon-start) cmd_translate_daemon_start ;;
+    translate-daemon-stop) cmd_translate_daemon_stop ;;
+    uninstall-shim|uninstall) cmd_uninstall_shim ;;
+    install-menubar) cmd_install_menubar ;;
+    menubar|menu) cmd_menubar ;;
+    ui|gui|panel) cmd_ui ;;
+    mode) if [[ $# -ge 1 ]]; then cmd_set_mode "$1"; else cmd_show_mode; fi ;;
+    translate) cmd_set_translate "${1:-status}" ;;
+    lang|app-lang) cmd_set_app_lang "${1:-auto}" ;;
+    set-mode) cmd_set_mode "${1:-}" ;;
+    *)
+      if [[ -f "$REGIONS_FILE" ]] && region_exists "$cmd" 2>/dev/null; then
+        set_region "$cmd"
+      else
+        die "未知命令: $cmd (fuckcc help)"
+      fi
+      ;;
+  esac
+}
+
+main "$@"
