@@ -3,7 +3,7 @@ class Fuckcc < Formula
   desc "Process-local Claude Code locale camouflage + free offline prompt translation (macOS)"
   homepage "https://github.com/lia0s1/fuckcc"
   url "https://github.com/lia0s1/fuckcc/archive/refs/tags/v4.4.2.tar.gz"
-  sha256 "66c03600eec4a1405c9b48e4d0eefa206b4e8162af476ae5d893c0eaed97302e"
+  sha256 "41ea5f3bc34f43c599e1c2037f1a44cb0d64a8715049de8bcc89a4ae5cb26707"
   license "MIT"
   version "4.4.2"
   head "https://github.com/lia0s1/fuckcc.git", branch: "main"
