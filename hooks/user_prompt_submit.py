@@ -4,9 +4,15 @@ import hashlib
 import json
 import os
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
+
+# Hard internal budget for the whole translation step. The harness kills the
+# hook at `timeout` (45s) and discards ALL output; we must bail long before
+# that and emit "{}" so the prompt goes through untranslated instead.
+TRANSLATE_BUDGET_S = float(os.environ.get("FUCKCC_HOOK_BUDGET_S", "10"))
 HOME = Path.home()
 FUCKCC = Path(os.environ.get("FUCKCC_HOME", HOME / ".fuckcc"))
 REGION_FILE = FUCKCC / "current_region"
@@ -74,6 +80,38 @@ def translate(text: str, dst: str) -> tuple[str, str, str]:
     out, engine, src = translate_auto(text, dst, engine="auto" if eng in ("auto", "free", "daemon") else eng)
     cache_put(text, dst, out)
     return out, engine, src
+
+def translate_budgeted(text: str, dst: str) -> tuple[str, str, str] | None:
+    """Run translate() in a daemon thread; give up after TRANSLATE_BUDGET_S.
+
+    argos/ctranslate2 runs native code that ignores signals, so signal.alarm
+    cannot interrupt a stuck translation. A daemon thread + os._exit() by the
+    caller is the only reliable way to cap wall time.
+    """
+    box: dict[str, tuple[str, str, str]] = {}
+    done = threading.Event()
+
+    def work() -> None:
+        try:
+            box["r"] = translate(text, dst)
+        except Exception:
+            pass
+        finally:
+            done.set()
+
+    threading.Thread(target=work, daemon=True).start()
+    if done.wait(TRANSLATE_BUDGET_S):
+        return box.get("r")
+    return None
+
+def bail() -> "NoReturn":
+    """Print empty hook output and hard-exit without interpreter cleanup.
+
+    os._exit avoids shutdown hangs from argos' native threads.
+    """
+    print("{}")
+    sys.stdout.flush()
+    os._exit(0)
 def build_context(region: str, surface: str, translated: str, engine: str, src: str) -> str:
     rule = reply_rule_for_surface(surface)
     return f"""[FUCKCC locale camouflage — region={region}, surface={surface}, src={src}, engine={engine}]
@@ -100,7 +138,12 @@ def main() -> int:
     region = current_region()
     surface = region_target_lang(region)
     t0 = time.perf_counter()
-    translated, eng, src = translate(prompt, surface)
+    r = translate_budgeted(prompt, surface)
+    if r is None:
+        # Over budget or translator blew up: emit "{}" so the prompt passes
+        # through untranslated instead of being killed at the harness timeout.
+        bail()
+    translated, eng, src = r
     ms = (time.perf_counter() - t0) * 1000
     try:
         with (FUCKCC / "translate.log").open("a", encoding="utf-8") as f:

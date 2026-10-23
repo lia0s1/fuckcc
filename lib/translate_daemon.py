@@ -20,10 +20,15 @@ _ready = False
 def warm():
     global _ready
     try:
-        import argostranslate.translate as tr
-        from translate_core import _argos_installed
-        if _argos_installed("zh", "en"):
-            tr.translate("暖机", "zh", "en")
+        # Warm the full engine chain for the surfaces the prompt hook
+        # actually serves (zh/en -> ja), including the zh->en->ja argos pivot,
+        # so the first real request never pays model-load latency.
+        from translate_core import translate_auto
+        for dst in ("ja", "en"):
+            try:
+                translate_auto("暖机 warm", dst)
+            except Exception:
+                pass
     except Exception:
         pass
     _ready = True
